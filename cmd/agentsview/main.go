@@ -506,6 +506,9 @@ func runServe(cfg config.Config, opts serveOptions) {
 	srvOpts = append(srvOpts, server.WithArtifactExchangeRunner(
 		newDaemonArtifactExchangeRunner(cfg, database, engine, emitter),
 	))
+	if cfg.BasePath != "" {
+		srvOpts = append(srvOpts, server.WithBasePath(cfg.BasePath))
+	}
 	srv := server.New(cfg, database, engine, srvOpts...)
 
 	startupProgress.SetPhase("starting HTTP server")

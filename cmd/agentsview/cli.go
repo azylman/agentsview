@@ -727,11 +727,6 @@ func newPGServeCommand() *cobra.Command {
 			runPGServe(appCfg, basePath)
 		},
 	}
-	cmd.Flags().String(
-		"base-path",
-		"",
-		"URL prefix for reverse-proxy subpath (e.g. /agentsview)",
-	)
 	config.RegisterServePFlags(cmd.Flags())
 	return cmd
 }
@@ -802,11 +797,6 @@ func newDuckDBServeCommand() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().String(
-		"base-path",
-		"",
-		"URL prefix for reverse-proxy subpath (e.g. /agentsview)",
-	)
 	config.RegisterServePFlags(cmd.Flags())
 	return cmd
 }

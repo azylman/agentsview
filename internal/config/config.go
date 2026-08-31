@@ -648,6 +648,7 @@ type Config struct {
 	ChartPalette         ChartPalette           `json:"chart_palette" toml:"chart_palette"`
 	DataDir              string                 `json:"data_dir" toml:"data_dir"`
 	DBPath               string                 `json:"-" toml:"-"`
+	BasePath             string                 `json:"base_path,omitempty" toml:"base_path"`
 	PublicURL            string                 `json:"public_url,omitempty" toml:"public_url"`
 	PublicOrigins        []string               `json:"public_origins,omitempty" toml:"public_origins"`
 	Proxy                ProxyConfig            `json:"proxy,omitempty" toml:"proxy"`
@@ -1349,6 +1350,7 @@ func (c *Config) applyConfigTOML(data string) error {
 		Port                           int                    `toml:"port"`
 		ChartPalette                   ChartPalette           `toml:"chart_palette"`
 		PublicURL                      string                 `toml:"public_url"`
+		BasePath                       string                 `toml:"base_path"`
 		PublicOrigins                  []string               `toml:"public_origins"`
 		Proxy                          ProxyConfig            `toml:"proxy"`
 		WatchExcludePatterns           []string               `toml:"watch_exclude_patterns"`
@@ -1416,6 +1418,9 @@ func (c *Config) applyConfigTOML(data string) error {
 	}
 	if file.PublicURL != "" {
 		c.PublicURL = file.PublicURL
+	}
+	if file.BasePath != "" && c.BasePath == "" {
+		c.BasePath = file.BasePath
 	}
 	if file.PublicOrigins != nil {
 		c.PublicOrigins = file.PublicOrigins
@@ -1739,6 +1744,22 @@ func (c *Config) withConfigLock(fn func() error) error {
 	return fn()
 }
 
+// NormalizeBasePath normalizes a URL base path for reverse-proxy hosting:
+// "" or "/" -> ""
+// "conversations" -> "/conversations"
+// "/conversations/" -> "/conversations"
+// "  /conversations/  " -> "/conversations"
+func NormalizeBasePath(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "/" {
+		return ""
+	}
+	if !strings.HasPrefix(raw, "/") {
+		raw = "/" + raw
+	}
+	return strings.TrimRight(raw, "/")
+}
+
 // dataDirFromEnv returns the data directory from the environment, preferring
 // AGENTSVIEW_DATA_DIR and falling back to the legacy AGENT_VIEWER_DATA_DIR.
 // Returns "" when neither is set.
@@ -1766,6 +1787,9 @@ func (c *Config) loadEnv() {
 	}
 	if v := dataDirFromEnv(); v != "" {
 		c.DataDir = v
+	}
+	if v := os.Getenv("AGENTSVIEW_BASE_PATH"); v != "" {
+		c.BasePath = v
 	}
 	if v := os.Getenv("AGENTSVIEW_AUTH_TOKEN"); v != "" {
 		c.AuthToken = v
@@ -1925,6 +1949,10 @@ func RegisterServeFlags(fs *flag.FlagSet) {
 
 // RegisterServePFlags registers serve-command flags on fs.
 func RegisterServePFlags(fs *pflag.FlagSet) {
+	fs.String(
+		"base-path", "",
+		"URL prefix for reverse-proxy subpath (e.g. /conversations)",
+	)
 	fs.String("host", "127.0.0.1", "Host to bind to")
 	fs.Int("port", 8080, "Port to listen on")
 	fs.String(
@@ -2013,6 +2041,8 @@ func applyPFlags(cfg *Config, fs *pflag.FlagSet) {
 
 func applyFlagValue(cfg *Config, name, value string) {
 	switch name {
+	case "base-path":
+		cfg.BasePath = value
 	case "host":
 		cfg.Host = value
 		cfg.HostExplicit = true
@@ -2076,6 +2106,7 @@ func splitFlagList(value string) []string {
 
 func finalize(cfg *Config) error {
 	var err error
+	cfg.BasePath = NormalizeBasePath(cfg.BasePath)
 	if err := expandLocalPaths(cfg); err != nil {
 		return err
 	}

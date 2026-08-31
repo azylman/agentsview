@@ -306,6 +306,64 @@ func TestLoad_WriteTimeout(t *testing.T) {
 	}
 }
 
+func TestLoad_BasePath(t *testing.T) {
+	t.Run("defaults to empty string when unset", func(t *testing.T) {
+		cfg, err := loadConfigFromPFlags(t)
+		require.NoError(t, err)
+		assert.Equal(t, "", cfg.BasePath)
+	})
+
+	t.Run("flag sets and normalizes base path", func(t *testing.T) {
+		cases := []struct {
+			name  string
+			value string
+			want  string
+		}{
+			{"standard subpath", "/conversations", "/conversations"},
+			{"trailing slash", "/conversations/", "/conversations"},
+			{"missing leading slash", "conversations", "/conversations"},
+			{"whitespace and slashes", "  /conversations/  ", "/conversations"},
+			{"root slash", "/", ""},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				cfg, err := loadConfigFromPFlags(t, "--base-path", tc.value)
+				require.NoError(t, err)
+				assert.Equal(t, tc.want, cfg.BasePath)
+			})
+		}
+	})
+
+	t.Run("environment variable sets base path", func(t *testing.T) {
+		t.Setenv("AGENTSVIEW_BASE_PATH", "/conversations")
+		cfg, err := loadConfigFromPFlags(t)
+		require.NoError(t, err)
+		assert.Equal(t, "/conversations", cfg.BasePath)
+	})
+
+	t.Run("flag overrides environment variable", func(t *testing.T) {
+		t.Setenv("AGENTSVIEW_BASE_PATH", "/env-path")
+		cfg, err := loadConfigFromPFlags(t, "--base-path", "/flag-path")
+		require.NoError(t, err)
+		assert.Equal(t, "/flag-path", cfg.BasePath)
+	})
+
+	t.Run("environment variable overrides toml config", func(t *testing.T) {
+		f := newConfigFixture(t)
+		f.WriteConfigText(t, `base_path = "/toml-path"`)
+		t.Setenv("AGENTSVIEW_BASE_PATH", "/env-path")
+		cfg := f.LoadMinimal(t)
+		assert.Equal(t, "/env-path", cfg.BasePath)
+	})
+
+	t.Run("toml config sets base path when flag and env are unset", func(t *testing.T) {
+		f := newConfigFixture(t)
+		f.WriteConfigText(t, `base_path = "/toml-path"`)
+		cfg := f.LoadMinimal(t)
+		assert.Equal(t, "/toml-path", cfg.BasePath)
+	})
+}
+
 func TestLoadMinimal_LoadsAgentBinaryConfig(t *testing.T) {
 	f := newConfigFixture(t)
 	f.WriteConfigText(t, `[agent.claude]
