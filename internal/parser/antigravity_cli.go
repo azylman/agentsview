@@ -135,6 +135,9 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 		brainTranscriptMsgs,
 	)
 
+	historyMsgs := collectAntigravityHistoryMessages(
+		filepath.Join(root, "history.jsonl"), id,
+	)
 	var dbErr error
 	if ext == ".db" {
 		var dbResult antigravityStepLoadResult
@@ -171,9 +174,6 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 			hasDisplayableAntigravityCLITrajectoryMessage(tRes.messages)
 		sidecarCovers := dbErr != nil || dbResult.rawStepCount == 0 ||
 			tRes.rawSteps >= dbResult.rawStepCount
-		historyMsgs := collectAntigravityHistoryMessages(
-			filepath.Join(root, "history.jsonl"), id,
-		)
 		var brainMergedMsgs []ParsedMessage
 		var brainTranscriptCovers bool
 		if dbErr == nil && brainTranscriptOK {
@@ -247,16 +247,21 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 			}
 		}
 		if !hasTrajectory && brainTranscriptOK {
-			messages = brainTranscriptMsgs
+			brainMergedMsgs, brainTranscriptCovers := mergeAntigravityCLIBrainTranscript(
+				brainTranscriptSteps, antigravityStepLoadResult{}, historyMsgs,
+			)
+			messages = brainMergedMsgs
 			hasTrajectory = true
-			transcriptFidelity = TranscriptFidelityFull
+			if brainTranscriptCovers {
+				transcriptFidelity = TranscriptFidelityFull
+			} else {
+				status.NeedsRetry = true
+			}
 		}
 	}
 
 	if !hasTrajectory {
-		messages = collectAntigravityHistoryMessages(
-			filepath.Join(root, "history.jsonl"), id,
-		)
+		messages = historyMsgs
 	}
 	messages = append(
 		messages,
@@ -513,7 +518,6 @@ func mergeAntigravityCLIBrainTranscript(
 		merged = append(merged, msg)
 	}
 	history := nonEmptyAntigravityHistoryMessages(historyMsgs)
-	merged = appendMissingAntigravityHistoryMessages(merged, history)
 	covers := len(merged) > 0 && brainUserCount >= len(history)
 	for _, dbStep := range dbResult.steps {
 		if dbStep.decoded {
@@ -525,6 +529,7 @@ func mergeAntigravityCLIBrainTranscript(
 			covers = false
 		}
 	}
+	merged = appendMissingAntigravityHistoryMessages(merged, history)
 	return merged, covers
 }
 
@@ -572,13 +577,23 @@ func mergeAntigravityDBHistoryMessages(
 func appendMissingAntigravityHistoryMessages(
 	dbMessages []ParsedMessage, history []ParsedMessage,
 ) []ParsedMessage {
-	seen := make(map[string]struct{})
+	type existingUserTurn struct {
+		key   string
+		unix  int64
+		hasTS bool
+		used  bool
+	}
+	var existing []existingUserTurn
 	for _, msg := range dbMessages {
 		if msg.Role != RoleUser {
 			continue
 		}
 		if key := normalizedAntigravityPrompt(msg.Content); key != "" {
-			seen[key] = struct{}{}
+			existing = append(existing, existingUserTurn{
+				key:   key,
+				unix:  msg.Timestamp.Unix(),
+				hasTS: !msg.Timestamp.IsZero(),
+			})
 		}
 	}
 	out := dbMessages
@@ -587,11 +602,30 @@ func appendMissingAntigravityHistoryMessages(
 		if key == "" {
 			continue
 		}
-		if _, ok := seen[key]; ok {
-			continue
+		matched := false
+		if !msg.Timestamp.IsZero() {
+			wantUnix := msg.Timestamp.Unix()
+			for i := range existing {
+				if !existing[i].used && existing[i].key == key &&
+					existing[i].hasTS && existing[i].unix == wantUnix {
+					existing[i].used = true
+					matched = true
+					break
+				}
+			}
 		}
-		out = append(out, msg)
-		seen[key] = struct{}{}
+		if !matched {
+			for i := range existing {
+				if !existing[i].used && existing[i].key == key {
+					existing[i].used = true
+					matched = true
+					break
+				}
+			}
+		}
+		if !matched {
+			out = append(out, msg)
+		}
 	}
 	return out
 }

@@ -1346,32 +1346,44 @@ func TestAntigravityCLIBrainTranscriptAndFailClosed(t *testing.T) {
 	laggingBrainLine := `{"step_index":0,"type":"USER_INPUT","created_at":"2026-05-17T06:40:00Z","content":"Check deployment"}` + "\n" +
 		`{"step_index":1,"type":"SYSTEM","created_at":"2026-05-17T06:40:01Z"}` + "\n"
 	assistantOnlyBrainLine := `{"step_index":1,"type":"PLANNER_RESPONSE","created_at":"2026-05-17T06:41:40Z","content":"Healthy.","thinking":"Checking","tool_calls":[{"id":"c1","name":"list_jobs","args":{}}]}` + "\n"
+	singleHistory := `{"conversationId":"` + id + `","timestamp":1779000000000,"display":"Check deployment"}` + "\n"
+	repeatedHistory := `{"conversationId":"` + id + `","timestamp":1779000000000,"display":"Check deployment"}` + "\n" +
+		`{"conversationId":"` + id + `","timestamp":1779000050000,"display":"Check deployment"}` + "\n"
+	matchingDBHistory := `{"conversationId":"` + id + `","timestamp":1779000000000,"display":"user prompt text goes here"}` + "\n"
 	tests := []struct {
 		name             string
+		ext              string
 		corruptDB        bool
 		undecodableSteps bool
-		historyPrompt    string
+		historyJSONL     string
 		transcript       string
 		wantErr          bool
 		wantVersion      DataVersionState
+		wantMsgCount     int
+		wantFirstPrompt  string
 		wantThinking     bool
 		wantContent      string
 	}{
-		{"brain transcript wins and preserves gen_metadata usage", false, false, "", fullBrainLine, false, DataVersionCurrent, true, "Healthy."},
-		{"lagging brain transcript keeps uncovered db step and retries", false, false, "", laggingBrainLine, false, DataVersionNeedsRetry, false, "assistant reply content body"},
-		{"assistant-only brain transcript with undecodable db steps merges history and preserves gen_metadata", false, true, "Check deployment", assistantOnlyBrainLine, false, DataVersionNeedsRetry, true, "Healthy."},
-		{"unreadable db with stale brain transcript fails closed", true, false, "", fullBrainLine, true, DataVersionCurrent, false, ""},
+		{"brain transcript wins and preserves gen_metadata usage", ".db", false, false, "", fullBrainLine, false, DataVersionCurrent, 2, "Check deployment", true, "Healthy."},
+		{"lagging brain transcript keeps uncovered db step and retries", ".db", false, false, "", laggingBrainLine, false, DataVersionNeedsRetry, 2, "Check deployment", false, "assistant reply content body"},
+		{"assistant-only brain transcript with undecodable db steps merges history and preserves gen_metadata", ".db", false, true, singleHistory, assistantOnlyBrainLine, false, DataVersionNeedsRetry, 2, "Check deployment", true, "Healthy."},
+		{"assistant-only brain transcript with repeated history prompts preserves all occurrences", ".db", false, true, repeatedHistory, assistantOnlyBrainLine, false, DataVersionNeedsRetry, 3, "Check deployment", true, "Healthy."},
+		{"decoded db user step absent from brain transcript is not duplicated by history", ".db", false, false, matchingDBHistory, assistantOnlyBrainLine, false, DataVersionNeedsRetry, 2, "user prompt text goes here", true, "Healthy."},
+		{"pb assistant-only brain transcript merges history and retries", ".pb", false, false, singleHistory, assistantOnlyBrainLine, false, DataVersionNeedsRetry, 2, "Check deployment", true, "Healthy."},
+		{"unreadable db with stale brain transcript fails closed", ".db", true, false, "", fullBrainLine, true, DataVersionCurrent, 0, "", false, ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
 			mustMkdir(t, filepath.Join(root, "conversations"))
-			dbPath := filepath.Join(root, "conversations", id+".db")
-			if tc.corruptDB {
-				mustWrite(t, dbPath, []byte("not-a-sqlite-database"))
+			sourcePath := filepath.Join(root, "conversations", id+tc.ext)
+			if tc.ext == ".pb" {
+				mustWrite(t, sourcePath, []byte("encrypted-pb-placeholder"))
+			} else if tc.corruptDB {
+				mustWrite(t, sourcePath, []byte("not-a-sqlite-database"))
 			} else {
-				createAntigravityTestDB(t, dbPath)
-				db, err := sql.Open("sqlite3", dbPath)
+				createAntigravityTestDB(t, sourcePath)
+				db, err := sql.Open("sqlite3", sourcePath)
 				require.NoError(t, err)
 				if tc.undecodableSteps {
 					mustExec(t, db, `UPDATE steps SET step_payload = X'00'`)
@@ -1381,9 +1393,8 @@ func TestAntigravityCLIBrainTranscriptAndFailClosed(t *testing.T) {
 				mustExec(t, db, `INSERT INTO gen_metadata (idx, data, size) VALUES (1, ?, ?)`, genData, len(genData))
 				require.NoError(t, db.Close())
 			}
-			if tc.historyPrompt != "" {
-				historyRow := `{"conversationId":"` + id + `","timestamp":1779000000000,"display":"` + tc.historyPrompt + `"}` + "\n"
-				mustWrite(t, filepath.Join(root, "history.jsonl"), []byte(historyRow))
+			if tc.historyJSONL != "" {
+				mustWrite(t, filepath.Join(root, "history.jsonl"), []byte(tc.historyJSONL))
 			}
 			tp := antigravityBrainTranscriptPath(root, id)
 			mustMkdir(t, filepath.Dir(tp))
@@ -1400,17 +1411,20 @@ func TestAntigravityCLIBrainTranscriptAndFailClosed(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantVersion, outcome.Results[0].DataVersion)
 			res := outcome.Results[0].Result
-			require.Len(t, res.Messages, 2)
-			assert.Equal(t, "Check deployment", res.Messages[0].Content)
-			assert.Contains(t, res.Messages[1].Content, tc.wantContent)
-			assert.Equal(t, tc.wantThinking, res.Messages[1].HasThinking)
-			assert.Equal(t, "Test Gemini 3.5", res.Messages[1].Model)
-			assert.Equal(t, 2400, res.Messages[1].ContextTokens)
-			assert.Equal(t, 180, res.Messages[1].OutputTokens)
-			assert.True(t, res.Messages[1].HasContextTokens)
-			assert.True(t, res.Messages[1].HasOutputTokens)
-			require.Len(t, res.UsageEvents, 1)
-			assert.Equal(t, 2400, res.UsageEvents[0].InputTokens)
+			require.Len(t, res.Messages, tc.wantMsgCount)
+			assert.Equal(t, tc.wantFirstPrompt, res.Messages[0].Content)
+			lastMsg := res.Messages[len(res.Messages)-1]
+			assert.Contains(t, lastMsg.Content, tc.wantContent)
+			assert.Equal(t, tc.wantThinking, lastMsg.HasThinking)
+			if tc.ext == ".db" {
+				assert.Equal(t, "Test Gemini 3.5", lastMsg.Model)
+				assert.Equal(t, 2400, lastMsg.ContextTokens)
+				assert.Equal(t, 180, lastMsg.OutputTokens)
+				assert.True(t, lastMsg.HasContextTokens)
+				assert.True(t, lastMsg.HasOutputTokens)
+				require.Len(t, res.UsageEvents, 1)
+				assert.Equal(t, 2400, res.UsageEvents[0].InputTokens)
+			}
 		})
 	}
 }
