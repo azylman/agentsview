@@ -121,31 +121,42 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 	// stays empty for legacy .pb and sidecar-only sessions where no schema
 	// is available, so SourceVersion is never fabricated.
 	var sourceVersion string
-	brainTranscriptMsgs, brainTranscriptErr := collectAntigravityBrainTranscriptMessages(
+	brainTranscriptSteps, brainTranscriptErr := collectAntigravityBrainTranscriptSteps(
 		antigravityBrainTranscriptPath(root, id),
 	)
 	if brainTranscriptErr != nil && !os.IsNotExist(brainTranscriptErr) {
 		return nil, nil, nil, status, brainTranscriptErr
 	}
+	brainTranscriptMsgs := make([]ParsedMessage, len(brainTranscriptSteps))
+	for i, s := range brainTranscriptSteps {
+		brainTranscriptMsgs[i] = s.msg
+	}
 	brainTranscriptOK := hasDisplayableAntigravityCLITrajectoryMessage(
 		brainTranscriptMsgs,
 	)
 
-	var dbErr error
 	if ext == ".db" {
-		var dbResult antigravityStepLoadResult
-		dbResult, dbErr = loadAntigravityCLIDBSteps(ctx, path)
+		dbResult, dbErr := loadAntigravityCLIDBSteps(ctx, path)
+		if dbErr != nil {
+			// Fail closed on an unreadable steps table, matching the IDE
+			// parser (roborev jobs 1982 and 2112): coverage of any sidecar
+			// or brain transcript cannot be proven without the DB's raw
+			// steps, and antigravityCLIProvider force-replaces on success,
+			// so a fallback rescue would overwrite previously archived
+			// messages and drop generation metadata.
+			status.NeedsRetry = true
+			return nil, nil, nil, status, dbErr
+		}
 		sourceVersion = dbResult.sourceVersion
 		hasGenMetadata = dbResult.hasGenMetadata
 		// gen_metadata token usage describes the session's actual
 		// consumption no matter which transcript source wins below.
 		// The sidecar also extracts generatorMetadata usage, but
 		// gen_metadata events win and sidecar events only fill the gap
-		// (unreadable DB or missing gen_metadata table) so the same
-		// generation is never counted twice.
+		// (missing gen_metadata table) so the same generation is never
+		// counted twice.
 		usageEvents = dbResult.usageEvents
-		dbOK := dbErr == nil &&
-			hasDisplayableAntigravityCLITrajectoryMessage(dbResult.messages)
+		dbOK := hasDisplayableAntigravityCLITrajectoryMessage(dbResult.messages)
 
 		// Prefer the agy-reader trajectory sidecar: it is the daemon's own
 		// decode, with structured tool calls/results and thinking, where the
@@ -165,25 +176,30 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 		}
 		sidecarOK := tErr == nil &&
 			hasDisplayableAntigravityCLITrajectoryMessage(tRes.messages)
-		sidecarCovers := dbErr != nil || dbResult.rawStepCount == 0 ||
+		sidecarCovers := dbResult.rawStepCount == 0 ||
 			tRes.rawSteps >= dbResult.rawStepCount
-		brainTranscriptCovers := dbErr != nil || len(dbResult.messages) == 0 ||
-			len(brainTranscriptMsgs) >= len(dbResult.messages)
+		historyMsgs := collectAntigravityHistoryMessages(
+			filepath.Join(root, "history.jsonl"), id,
+		)
+		brainMergedMsgs, brainTranscriptCovers := mergeAntigravityCLIBrainTranscript(
+			brainTranscriptSteps, dbResult, historyMsgs,
+		)
 		switch {
 		case sidecarOK && sidecarCovers:
 			messages = tRes.messages
 			hasTrajectory = true
 			transcriptFidelity = TranscriptFidelityFull
 		case brainTranscriptOK && brainTranscriptCovers:
-			messages = brainTranscriptMsgs
+			messages = brainMergedMsgs
 			hasTrajectory = true
 			transcriptFidelity = TranscriptFidelityFull
+		case brainTranscriptOK:
+			messages = brainMergedMsgs
+			hasTrajectory = true
+			status.NeedsRetry = true
 		case dbOK:
 			messages = mergeAntigravityDBHistoryMessages(
-				dbResult.messages,
-				collectAntigravityHistoryMessages(
-					filepath.Join(root, "history.jsonl"), id,
-				),
+				dbResult.messages, historyMsgs,
 			)
 			hasTrajectory = true
 		case sidecarOK:
@@ -193,19 +209,14 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 			messages = tRes.messages
 			hasTrajectory = true
 			status.NeedsRetry = true
-		case brainTranscriptOK:
-			messages = brainTranscriptMsgs
-			hasTrajectory = true
-			status.NeedsRetry = true
-		case dbErr != nil || dbResult.rawStepCount > 0:
+		case dbResult.rawStepCount > 0:
 			status.NeedsRetry = true
 		}
 		// Coverage gates usage just like the transcript: a lagging
 		// sidecar carries only the generations it has seen, and
 		// persisting those would underreport totals on a row that
 		// looks current. sidecarCovers stays true when the DB offers
-		// no coverage signal (unreadable or zero rows), so gap-fill
-		// still applies there.
+		// no coverage signal (zero rows), so gap-fill still applies there.
 		if len(usageEvents) == 0 && tErr == nil && sidecarCovers {
 			usageEvents = tRes.usageEvents
 		}
@@ -263,13 +274,6 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 		if extra, ok := decryptAntigravityCLITranscript(path); ok {
 			messages = append(messages, extra)
 		}
-	}
-
-	if ext == ".db" && dbErr != nil && len(messages) == 0 && len(usageEvents) == 0 {
-		// Fail closed when the SQLite database could not be read and no
-		// fallback source supplied messages or usage events, so sync does
-		// not clobber a previously stored transcript with an empty session.
-		return nil, nil, nil, status, dbErr
 	}
 
 	sort.SliceStable(messages, func(i, j int) bool {
@@ -461,6 +465,58 @@ func loadAntigravityCLIDBStepsWithOptions(
 		return result, err
 	}
 	return result, nil
+}
+
+func mergeAntigravityCLIBrainTranscript(
+	brainSteps []antigravityBrainTranscriptStep,
+	dbResult antigravityStepLoadResult,
+	historyMsgs []ParsedMessage,
+) ([]ParsedMessage, bool) {
+	dbByIdx := make(map[int]ParsedMessage, len(dbResult.steps))
+	for _, dbStep := range dbResult.steps {
+		if dbStep.decoded {
+			dbByIdx[dbStep.idx] = dbStep.msg
+		}
+	}
+	brainDisplayableByIdx := make(map[int]struct{}, len(brainSteps))
+	maxBrainDisplayableIdx := -1
+	var merged []ParsedMessage
+	for _, step := range brainSteps {
+		if !hasDisplayableAntigravityCLITrajectoryMessage([]ParsedMessage{step.msg}) {
+			continue
+		}
+		msg := step.msg
+		if dbMsg, ok := dbByIdx[step.stepIndex]; ok {
+			if msg.Model == "" {
+				msg.Model = dbMsg.Model
+			}
+			if !msg.HasContextTokens && dbMsg.HasContextTokens {
+				msg.ContextTokens = dbMsg.ContextTokens
+				msg.HasContextTokens = true
+			}
+			if !msg.HasOutputTokens && dbMsg.HasOutputTokens {
+				msg.OutputTokens = dbMsg.OutputTokens
+				msg.HasOutputTokens = true
+			}
+		}
+		brainDisplayableByIdx[step.stepIndex] = struct{}{}
+		if step.stepIndex > maxBrainDisplayableIdx {
+			maxBrainDisplayableIdx = step.stepIndex
+		}
+		merged = append(merged, msg)
+	}
+	covers := len(merged) > 0 && len(merged) >= len(historyMsgs)
+	for _, dbStep := range dbResult.steps {
+		if dbStep.decoded {
+			if _, ok := brainDisplayableByIdx[dbStep.idx]; !ok {
+				covers = false
+				merged = append(merged, dbStep.msg)
+			}
+		} else if dbStep.idx > maxBrainDisplayableIdx {
+			covers = false
+		}
+	}
+	return merged, covers
 }
 
 func mergeAntigravityDBHistoryMessages(

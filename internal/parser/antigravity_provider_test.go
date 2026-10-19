@@ -1329,20 +1329,34 @@ func TestAntigravityProvidersReadOnlyCheckpointedWAL(t *testing.T) {
 			outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
 			require.NoError(t, err)
 			require.Len(t, outcome.Results, 1)
-			assert.NotEmpty(t, outcome.Results[0].Result.Messages)
+			assert.Equal(t, DataVersionCurrent, outcome.Results[0].DataVersion)
+			var bodies []string
+			for _, m := range outcome.Results[0].Result.Messages {
+				bodies = append(bodies, m.Content)
+			}
+			assert.Contains(t, strings.Join(bodies, "\n"), "assistant reply content body")
 		})
 	}
 }
 
 func TestAntigravityCLIBrainTranscriptAndFailClosed(t *testing.T) {
 	const id = "99999999-aaaa-bbbb-cccc-dddddddddddd"
+	fullBrainLine := `{"step_index":0,"type":"USER_INPUT","created_at":"2026-10-19T10:00:00Z","content":"Check deployment"}` + "\n" +
+		`{"step_index":1,"type":"PLANNER_RESPONSE","created_at":"2026-10-19T10:00:05Z","content":"Healthy.","thinking":"Checking","tool_calls":[{"id":"c1","name":"list_jobs","args":{}}]}` + "\n"
+	laggingBrainLine := `{"step_index":0,"type":"USER_INPUT","created_at":"2026-10-19T10:00:00Z","content":"Check deployment"}` + "\n" +
+		`{"step_index":1,"type":"SYSTEM","created_at":"2026-10-19T10:00:01Z"}` + "\n"
 	tests := []struct {
-		name      string
-		corruptDB bool
-		wantErr   bool
+		name         string
+		corruptDB    bool
+		transcript   string
+		wantErr      bool
+		wantVersion  DataVersionState
+		wantThinking bool
+		wantContent  string
 	}{
-		{"brain transcript wins and preserves gen_metadata usage", false, false},
-		{"unreadable db without fallback fails closed", true, true},
+		{"brain transcript wins and preserves gen_metadata usage", false, fullBrainLine, false, DataVersionCurrent, true, "Healthy."},
+		{"lagging brain transcript keeps uncovered db step and retries", false, laggingBrainLine, false, DataVersionNeedsRetry, false, "assistant reply content body"},
+		{"unreadable db with stale brain transcript fails closed", true, fullBrainLine, true, DataVersionCurrent, false, ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1359,13 +1373,10 @@ func TestAntigravityCLIBrainTranscriptAndFailClosed(t *testing.T) {
 				genData := createAntigravityMockGenMetadata(t, 2400, 180, 0, "Test Gemini 3.5")
 				mustExec(t, db, `INSERT INTO gen_metadata (idx, data, size) VALUES (1, ?, ?)`, genData, len(genData))
 				require.NoError(t, db.Close())
-				tp := antigravityBrainTranscriptPath(root, id)
-				mustMkdir(t, filepath.Dir(tp))
-				mustWrite(t, tp, []byte(
-					`{"step_index":1,"type":"USER_INPUT","created_at":"2026-10-19T10:00:00Z","content":"Check deployment"}`+"\n"+
-						`{"step_index":2,"type":"PLANNER_RESPONSE","created_at":"2026-10-19T10:00:05Z","content":"Healthy.","thinking":"Checking","tool_calls":[{"id":"c1","name":"list_jobs","args":{}}]}`+"\n",
-				))
 			}
+			tp := antigravityBrainTranscriptPath(root, id)
+			mustMkdir(t, filepath.Dir(tp))
+			mustWrite(t, tp, []byte(tc.transcript))
 			provider, _ := NewProvider(AgentAntigravityCLI, ProviderConfig{Roots: []string{root}, Machine: "devbox"})
 			source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: id})
 			require.NoError(t, err)
@@ -1376,10 +1387,16 @@ func TestAntigravityCLIBrainTranscriptAndFailClosed(t *testing.T) {
 				return
 			}
 			require.NoError(t, err)
+			assert.Equal(t, tc.wantVersion, outcome.Results[0].DataVersion)
 			res := outcome.Results[0].Result
 			require.Len(t, res.Messages, 2)
-			assert.Equal(t, TranscriptFidelityFull, res.Session.TranscriptFidelity)
-			assert.True(t, res.Messages[1].HasThinking)
+			assert.Contains(t, res.Messages[1].Content, tc.wantContent)
+			assert.Equal(t, tc.wantThinking, res.Messages[1].HasThinking)
+			assert.Equal(t, "Test Gemini 3.5", res.Messages[1].Model)
+			assert.Equal(t, 2400, res.Messages[1].ContextTokens)
+			assert.Equal(t, 180, res.Messages[1].OutputTokens)
+			assert.True(t, res.Messages[1].HasContextTokens)
+			assert.True(t, res.Messages[1].HasOutputTokens)
 			require.Len(t, res.UsageEvents, 1)
 			assert.Equal(t, 2400, res.UsageEvents[0].InputTokens)
 		})
