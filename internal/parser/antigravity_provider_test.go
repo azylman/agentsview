@@ -215,10 +215,15 @@ func TestAntigravityCLIProviderSourceMethods(t *testing.T) {
 	require.Len(t, plan.Roots, 5)
 	assert.Equal(t, filepath.Join(root, "brain"), plan.Roots[0].Path)
 	assert.True(t, plan.Roots[0].Recursive)
-	assert.Equal(t, 1, plan.Roots[0].MaxDepth,
-		"only brain/<id>/*.md is parsed; deeper brain trees stay unwatched")
-	assert.Empty(t, plan.Roots[0].ExtraDirectories,
-		"the CLI brain root does not read the IDE transcript directory")
+	assert.Equal(t, 1, plan.Roots[0].MaxDepth)
+	assert.Equal(t, []string{
+		"*/.system_generated/logs",
+	}, plan.Roots[0].ExtraDirectories)
+	assert.Equal(t, []string{
+		"*.md",
+		"*.md.metadata.json",
+		"transcript.jsonl",
+	}, plan.Roots[0].IncludeGlobs)
 	assert.Equal(t, filepath.Join(root, "conversations"), plan.Roots[1].Path)
 	assert.False(t, plan.Roots[1].Recursive)
 	assert.Equal(t, filepath.Clean(root), filepath.Clean(plan.Roots[2].Path))
@@ -1298,4 +1303,86 @@ func leaveAntigravityWALSidecars(t *testing.T, dbPath string) {
 	}
 	require.NoError(t, conn.Close())
 	require.NoError(t, db.Close())
+}
+
+func TestAntigravityProvidersReadOnlyCheckpointedWAL(t *testing.T) {
+	for name, tc := range antigravitySQLiteProviderCases() {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			id := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+			dbPath := filepath.Join(root, "conversations", id+".db")
+			tc.fixture(t, root, id)
+			db, err := sql.Open("sqlite3", dbPath)
+			require.NoError(t, err)
+			_, err = db.Exec("PRAGMA journal_mode=WAL; PRAGMA user_version=1;")
+			require.NoError(t, err)
+			require.NoError(t, db.Close())
+
+			shmPath, convDir := dbPath+"-shm", filepath.Dir(dbPath)
+			require.NoError(t, os.Mkdir(shmPath, 0o555))
+			require.NoError(t, os.Chmod(convDir, 0o555))
+			t.Cleanup(func() { _ = os.Chmod(convDir, 0o755); _ = os.RemoveAll(shmPath) })
+
+			provider, _ := NewProvider(tc.agent, ProviderConfig{Roots: []string{root}, Machine: "devbox"})
+			source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: id})
+			require.NoError(t, err)
+			require.True(t, ok)
+			outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
+			require.NoError(t, err)
+			require.Len(t, outcome.Results, 1)
+			assert.NotEmpty(t, outcome.Results[0].Result.Messages)
+		})
+	}
+}
+
+func TestAntigravityCLIBrainTranscriptAndFailClosed(t *testing.T) {
+	const id = "99999999-aaaa-bbbb-cccc-dddddddddddd"
+	tests := []struct {
+		name      string
+		corruptDB bool
+		wantErr   bool
+	}{
+		{"brain transcript wins and preserves gen_metadata usage", false, false},
+		{"unreadable db without fallback fails closed", true, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			mustMkdir(t, filepath.Join(root, "conversations"))
+			dbPath := filepath.Join(root, "conversations", id+".db")
+			if tc.corruptDB {
+				mustWrite(t, dbPath, []byte("not-a-sqlite-database"))
+			} else {
+				createAntigravityTestDB(t, dbPath)
+				db, err := sql.Open("sqlite3", dbPath)
+				require.NoError(t, err)
+				mustExec(t, db, `CREATE TABLE gen_metadata (idx integer, data blob, size integer, PRIMARY KEY (idx))`)
+				genData := createAntigravityMockGenMetadata(t, 2400, 180, 0, "Test Gemini 3.5")
+				mustExec(t, db, `INSERT INTO gen_metadata (idx, data, size) VALUES (1, ?, ?)`, genData, len(genData))
+				require.NoError(t, db.Close())
+				tp := antigravityBrainTranscriptPath(root, id)
+				mustMkdir(t, filepath.Dir(tp))
+				mustWrite(t, tp, []byte(
+					`{"step_index":1,"type":"USER_INPUT","created_at":"2026-10-19T10:00:00Z","content":"Check deployment"}`+"\n"+
+						`{"step_index":2,"type":"PLANNER_RESPONSE","created_at":"2026-10-19T10:00:05Z","content":"Healthy.","thinking":"Checking","tool_calls":[{"id":"c1","name":"list_jobs","args":{}}]}`+"\n",
+				))
+			}
+			provider, _ := NewProvider(AgentAntigravityCLI, ProviderConfig{Roots: []string{root}, Machine: "devbox"})
+			source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: id})
+			require.NoError(t, err)
+			require.True(t, ok)
+			outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			res := outcome.Results[0].Result
+			require.Len(t, res.Messages, 2)
+			assert.Equal(t, TranscriptFidelityFull, res.Session.TranscriptFidelity)
+			assert.True(t, res.Messages[1].HasThinking)
+			require.Len(t, res.UsageEvents, 1)
+			assert.Equal(t, 2400, res.UsageEvents[0].InputTokens)
+		})
+	}
 }
