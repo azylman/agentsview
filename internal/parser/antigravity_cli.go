@@ -178,7 +178,7 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 		var brainTranscriptCovers bool
 		if dbErr == nil && brainTranscriptOK {
 			brainMergedMsgs, brainTranscriptCovers = mergeAntigravityCLIBrainTranscript(
-				brainTranscriptSteps, dbResult, historyMsgs,
+				brainTranscriptSteps, dbResult, tRes, historyMsgs,
 			)
 		}
 		switch {
@@ -248,7 +248,7 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 		}
 		if !hasTrajectory && brainTranscriptOK {
 			brainMergedMsgs, brainTranscriptCovers := mergeAntigravityCLIBrainTranscript(
-				brainTranscriptSteps, antigravityStepLoadResult{}, historyMsgs,
+				brainTranscriptSteps, antigravityStepLoadResult{}, agyTrajectoryParseResult{}, historyMsgs,
 			)
 			messages = brainMergedMsgs
 			hasTrajectory = true
@@ -480,11 +480,40 @@ func loadAntigravityCLIDBStepsWithOptions(
 func mergeAntigravityCLIBrainTranscript(
 	brainSteps []antigravityBrainTranscriptStep,
 	dbResult antigravityStepLoadResult,
+	sidecarRes agyTrajectoryParseResult,
 	historyMsgs []ParsedMessage,
 ) ([]ParsedMessage, bool) {
 	dbByIdx := make(map[int]ParsedMessage, len(dbResult.steps))
 	for _, dbStep := range dbResult.steps {
 		dbByIdx[dbStep.idx] = dbStep.msg
+	}
+	sidecarMsgsByIdx := make(map[int][]ParsedMessage)
+	var sidecarStepOrder []int
+	for i, m := range sidecarRes.messages {
+		if i >= len(sidecarRes.msgStepIndices) {
+			break
+		}
+		sIdx := sidecarRes.msgStepIndices[i]
+		if sIdx < 0 {
+			continue
+		}
+		if _, seen := sidecarMsgsByIdx[sIdx]; !seen {
+			sidecarStepOrder = append(sidecarStepOrder, sIdx)
+		}
+		if dbMsg, ok := dbByIdx[sIdx]; ok && m.Role == RoleAssistant {
+			if m.Model == "" {
+				m.Model = dbMsg.Model
+			}
+			if !m.HasContextTokens && dbMsg.HasContextTokens {
+				m.ContextTokens = dbMsg.ContextTokens
+				m.HasContextTokens = true
+			}
+			if !m.HasOutputTokens && dbMsg.HasOutputTokens {
+				m.OutputTokens = dbMsg.OutputTokens
+				m.HasOutputTokens = true
+			}
+		}
+		sidecarMsgsByIdx[sIdx] = append(sidecarMsgsByIdx[sIdx], m)
 	}
 	brainDisplayableRoleByIdx := make(map[int]RoleType, len(brainSteps))
 	brainTimestampByIdx := make(map[int]time.Time, len(brainSteps))
@@ -521,6 +550,12 @@ func mergeAntigravityCLIBrainTranscript(
 		}
 		merged = append(merged, msg)
 	}
+	for sIdx, sMsgs := range sidecarMsgsByIdx {
+		if _, exists := brainTimestampByIdx[sIdx]; !exists &&
+			len(sMsgs) > 0 && !sMsgs[0].Timestamp.IsZero() {
+			brainTimestampByIdx[sIdx] = sMsgs[0].Timestamp
+		}
+	}
 	for i, stepIdx := range dbResult.usageEventStepIndices {
 		if i >= len(dbResult.usageEvents) || dbResult.usageEvents[i].OccurredAt != "" {
 			continue
@@ -531,15 +566,29 @@ func mergeAntigravityCLIBrainTranscript(
 	}
 	history := nonEmptyAntigravityHistoryMessages(historyMsgs)
 	covers := len(merged) > 0 && brainUserCount >= len(history)
+	sidecarUsedIdx := make(map[int]bool, len(sidecarMsgsByIdx))
 	for _, dbStep := range dbResult.steps {
 		if !isAntigravityBrainStepCovered(
 			dbStep, brainDisplayableRoleByIdx, maxBrainDisplayableIdx,
 		) {
 			covers = false
-			if dbStep.decoded {
+			if sMsgs, ok := sidecarMsgsByIdx[dbStep.idx]; ok {
+				merged = append(merged, sMsgs...)
+				sidecarUsedIdx[dbStep.idx] = true
+			} else if dbStep.decoded {
 				merged = append(merged, dbStep.msg)
 			}
 		}
+	}
+	for _, sIdx := range sidecarStepOrder {
+		if sidecarUsedIdx[sIdx] {
+			continue
+		}
+		if _, coveredByBrain := brainDisplayableRoleByIdx[sIdx]; coveredByBrain {
+			continue
+		}
+		covers = false
+		merged = append(merged, sidecarMsgsByIdx[sIdx]...)
 	}
 	merged = appendMissingAntigravityHistoryMessages(merged, history)
 	return merged, covers
@@ -558,7 +607,8 @@ func isAntigravityBrainStepCovered(
 		return ok && role == RoleAssistant
 	default:
 		if ok {
-			return !dbStep.decoded || role == dbStep.msg.Role
+			return !dbStep.decoded || role == dbStep.msg.Role ||
+				(dbStep.msg.Role == RoleAssistant && role == RoleSystem)
 		}
 		if dbStep.decoded {
 			return false
@@ -574,10 +624,7 @@ func isAntigravityNonTranscriptStepKind(kind antigravityStepKind) bool {
 		antigravityStepKindGrepSearch,
 		antigravityStepKindViewFile,
 		antigravityStepKindListDirectory,
-		antigravityStepKindRunCommand,
-		antigravityStepKindCheckpoint,
-		antigravityStepKindSystemMessage,
-		antigravityStepKindGeneric:
+		antigravityStepKindRunCommand:
 		return true
 	default:
 		return false
@@ -629,10 +676,10 @@ func appendMissingAntigravityHistoryMessages(
 	dbMessages []ParsedMessage, history []ParsedMessage,
 ) []ParsedMessage {
 	type existingUserTurn struct {
-		key   string
-		unix  int64
-		hasTS bool
-		used  bool
+		key       string
+		unixMilli int64
+		hasTS     bool
+		used      bool
 	}
 	var existing []existingUserTurn
 	for _, msg := range dbMessages {
@@ -641,9 +688,9 @@ func appendMissingAntigravityHistoryMessages(
 		}
 		if key := normalizedAntigravityPrompt(msg.Content); key != "" {
 			existing = append(existing, existingUserTurn{
-				key:   key,
-				unix:  msg.Timestamp.Unix(),
-				hasTS: !msg.Timestamp.IsZero(),
+				key:       key,
+				unixMilli: msg.Timestamp.UnixMilli(),
+				hasTS:     !msg.Timestamp.IsZero(),
 			})
 		}
 	}
@@ -657,10 +704,10 @@ func appendMissingAntigravityHistoryMessages(
 		if msg.Timestamp.IsZero() {
 			continue
 		}
-		wantUnix := msg.Timestamp.Unix()
+		wantMilli := msg.Timestamp.UnixMilli()
 		for i := range existing {
 			if !existing[i].used && existing[i].key == key &&
-				existing[i].hasTS && existing[i].unix == wantUnix {
+				existing[i].hasTS && existing[i].unixMilli == wantMilli {
 				existing[i].used = true
 				matched[hIdx] = true
 				break
@@ -1641,6 +1688,7 @@ func agyToolDetail(name, inputJSON string) string {
 // generatorMetadata.
 type agyTrajectoryParseResult struct {
 	messages        []ParsedMessage
+	msgStepIndices  []int
 	rawSteps        int
 	usageEvents     []ParsedUsageEvent
 	parentCascadeID string
@@ -1715,10 +1763,12 @@ func parseAntigravityCLITrajectory(
 	}
 
 	var msgs []ParsedMessage
+	var msgStepIndices []int
 	// plannerMsgIdx maps a PLANNER_RESPONSE step index to the index of
 	// the assistant message it produced in msgs, so generatorMetadata
 	// usage can be attributed to the right message.
 	plannerMsgIdx := make(map[int]int)
+	lastPlannerStepIdx := -1
 
 	var pendingResults []ParsedToolResult
 	var pendingResultsTime time.Time
@@ -1739,6 +1789,7 @@ func parseAntigravityCLITrajectory(
 			Timestamp:   pendingResultsTime,
 			ToolResults: pendingResults,
 		})
+		msgStepIndices = append(msgStepIndices, lastPlannerStepIdx)
 		pendingResults = nil
 	}
 
@@ -1757,6 +1808,7 @@ func parseAntigravityCLITrajectory(
 				ContentLength: len(step.UserInput.UserResponse),
 				Timestamp:     stepTime,
 			})
+			msgStepIndices = append(msgStepIndices, stepIdx)
 
 		case "CORTEX_STEP_TYPE_PLANNER_RESPONSE":
 			flushPendingResults()
@@ -1802,7 +1854,9 @@ func parseAntigravityCLITrajectory(
 				msg.HasThinking = true
 			}
 			msgs = append(msgs, msg)
+			msgStepIndices = append(msgStepIndices, stepIdx)
 			plannerMsgIdx[stepIdx] = len(msgs) - 1
+			lastPlannerStepIdx = stepIdx
 
 		case "CORTEX_STEP_TYPE_RUN_COMMAND",
 			"CORTEX_STEP_TYPE_VIEW_FILE",
@@ -1887,6 +1941,7 @@ func parseAntigravityCLITrajectory(
 				ContentLength: len(step.SystemMessage.Message),
 				Timestamp:     stepTime,
 			})
+			msgStepIndices = append(msgStepIndices, stepIdx)
 
 		case "CORTEX_STEP_TYPE_CHECKPOINT":
 			flushPendingResults()
@@ -1910,14 +1965,16 @@ func parseAntigravityCLITrajectory(
 					ContentLength: len(content),
 					Timestamp:     stepTime,
 				})
+				msgStepIndices = append(msgStepIndices, stepIdx)
 			}
 		}
 	}
 
 	flushPendingResults()
 	return agyTrajectoryParseResult{
-		messages: msgs,
-		rawSteps: len(traj.Steps),
+		messages:       msgs,
+		msgStepIndices: msgStepIndices,
+		rawSteps:       len(traj.Steps),
 		usageEvents: extractAgyGeneratorUsage(
 			traj, plannerMsgIdx, msgs, executors,
 		),
