@@ -1314,8 +1314,7 @@ func TestAntigravityProvidersReadOnlyCheckpointedWAL(t *testing.T) {
 			tc.fixture(t, root, id)
 			db, err := sql.Open("sqlite3", dbPath)
 			require.NoError(t, err)
-			_, err = db.Exec("PRAGMA journal_mode=WAL; PRAGMA user_version=1;")
-			require.NoError(t, err)
+			mustExec(t, db, "PRAGMA journal_mode=WAL; PRAGMA user_version=1;")
 			require.NoError(t, db.Close())
 
 			shmPath, convDir := dbPath+"-shm", filepath.Dir(dbPath)
