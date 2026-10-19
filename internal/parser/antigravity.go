@@ -271,9 +271,10 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
 }
 
 type antigravityStepLoadResult struct {
-	messages    []ParsedMessage
-	steps       []antigravityLoadedStep
-	usageEvents []ParsedUsageEvent
+	messages              []ParsedMessage
+	steps                 []antigravityLoadedStep
+	usageEvents           []ParsedUsageEvent
+	usageEventStepIndices []int
 	// executors is retained for preferred trajectory sidecars so their
 	// generatorMetadata uses the same range-qualified model attribution as
 	// SQLite gen_metadata.
@@ -294,8 +295,16 @@ type antigravityStepLoadResult struct {
 type antigravityStepKind int
 
 const (
+	antigravityStepKindCodeAction      antigravityStepKind = 5
+	antigravityStepKindGrepSearch      antigravityStepKind = 7
+	antigravityStepKindViewFile        antigravityStepKind = 8
+	antigravityStepKindListDirectory   antigravityStepKind = 9
 	antigravityStepKindUserInput       antigravityStepKind = 14
 	antigravityStepKindPlannerResponse antigravityStepKind = 15
+	antigravityStepKindRunCommand      antigravityStepKind = 21
+	antigravityStepKindCheckpoint      antigravityStepKind = 23
+	antigravityStepKindSystemMessage   antigravityStepKind = 101
+	antigravityStepKindGeneric         antigravityStepKind = 132
 )
 
 // These field numbers come from the FileDescriptorProto records embedded in
@@ -424,18 +433,23 @@ func loadAntigravityStepsWithRawCount(ctx context.Context,
 			generation, steps, stepPositions,
 		)
 		executorModel := ""
-		if stepIndex, known := generation.maxStepIndex(); known {
-			executorModel = executorModelForStep(executors, stepIndex)
+		maxStepIdx, known := generation.maxStepIndex()
+		if known {
+			executorModel = executorModelForStep(executors, maxStepIdx)
 		}
 		if !found {
+			stepIdx := -1
+			if known {
+				stepIdx = maxStepIdx
+			}
 			result.appendGenMetadataUsage(
-				generation.data, ParsedMessage{}, false, executorModel,
+				stepIdx, generation.data, ParsedMessage{}, false, executorModel,
 			)
 			continue
 		}
 		step := &steps[position]
 		step.msg = result.appendGenMetadataUsage(
-			generation.data, step.msg, step.decoded, executorModel,
+			step.idx, generation.data, step.msg, step.decoded, executorModel,
 		)
 	}
 	for _, step := range steps {
@@ -624,6 +638,7 @@ func generationPlannerStep(
 	positions map[int]int,
 ) (int, bool) {
 	fallbackPos := -1
+	plannerPos := -1
 	for _, idx := range generation.stepIndices {
 		position, ok := positions[idx]
 		if !ok {
@@ -633,12 +648,19 @@ func generationPlannerStep(
 			fallbackPos = position
 		}
 		step := steps[position]
-		if step.kind == antigravityStepKindPlannerResponse &&
-			step.decoded {
-			return position, true
+		if step.kind == antigravityStepKindPlannerResponse {
+			if step.decoded {
+				return position, true
+			}
+			if plannerPos < 0 {
+				plannerPos = position
+			}
 		}
 	}
 	if generation.hasStepIndices {
+		if plannerPos >= 0 {
+			return plannerPos, true
+		}
 		if fallbackPos >= 0 {
 			return fallbackPos, true
 		}
@@ -666,6 +688,7 @@ func executorModelForStep(
 // the CLI trajectory sidecar or brain transcript, and its usage must not
 // be dropped.
 func (r *antigravityStepLoadResult) appendGenMetadataUsage(
+	stepIdx int,
 	data []byte,
 	msg ParsedMessage,
 	decoded bool,
@@ -702,6 +725,7 @@ func (r *antigravityStepLoadResult) appendGenMetadataUsage(
 			ReasoningTokens:      0, // not available in gen_metadata
 			OccurredAt:           occurredAt,
 		})
+		r.usageEventStepIndices = append(r.usageEventStepIndices, stepIdx)
 	}
 	if genModel != "" {
 		msg.Model = genModel

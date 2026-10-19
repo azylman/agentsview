@@ -225,15 +225,21 @@ func antigravityBrainToolCalls(calls gjson.Result) []ParsedToolCall {
 // unrecognized producer is treated as a system row rather than dropped: the
 // step's text is still part of the conversation, and claiming it for the user
 // or the model would be a guess.
-func roleForAntigravityBrainSource(source string) (RoleType, bool) {
+func roleForAntigravityBrainSource(source, stepType string) (RoleType, bool) {
 	switch source {
 	case "USER_EXPLICIT":
 		return RoleUser, false
 	case "MODEL":
 		return RoleAssistant, false
-	default:
-		return RoleSystem, true
+	case "":
+		switch stepType {
+		case "USER_INPUT", "CORTEX_STEP_TYPE_USER_INPUT":
+			return RoleUser, false
+		case "PLANNER_RESPONSE", "CORTEX_STEP_TYPE_PLANNER_RESPONSE":
+			return RoleAssistant, false
+		}
 	}
+	return RoleSystem, true
 }
 
 // antigravityBrainTranscriptStep pairs a rendered transcript message with its
@@ -255,7 +261,9 @@ func collectAntigravityBrainTranscriptSteps(
 	}
 	steps := make([]antigravityBrainTranscriptStep, 0, len(entries))
 	for _, entry := range entries {
-		role, isSystem := roleForAntigravityBrainSource(entry.source)
+		role, isSystem := roleForAntigravityBrainSource(
+			entry.source, entry.stepType,
+		)
 		content := entry.content
 		toolCalls := entry.toolCalls
 		if content == "" && len(toolCalls) > 0 {

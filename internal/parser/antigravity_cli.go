@@ -486,11 +486,15 @@ func mergeAntigravityCLIBrainTranscript(
 	for _, dbStep := range dbResult.steps {
 		dbByIdx[dbStep.idx] = dbStep.msg
 	}
-	brainDisplayableByIdx := make(map[int]struct{}, len(brainSteps))
+	brainDisplayableRoleByIdx := make(map[int]RoleType, len(brainSteps))
+	brainTimestampByIdx := make(map[int]time.Time, len(brainSteps))
 	maxBrainDisplayableIdx := -1
 	brainUserCount := 0
 	var merged []ParsedMessage
 	for _, step := range brainSteps {
+		if !step.msg.Timestamp.IsZero() {
+			brainTimestampByIdx[step.stepIndex] = step.msg.Timestamp
+		}
 		if !hasDisplayableAntigravityCLITrajectoryMessage([]ParsedMessage{step.msg}) {
 			continue
 		}
@@ -511,26 +515,73 @@ func mergeAntigravityCLIBrainTranscript(
 				msg.HasOutputTokens = true
 			}
 		}
-		brainDisplayableByIdx[step.stepIndex] = struct{}{}
+		brainDisplayableRoleByIdx[step.stepIndex] = msg.Role
 		if step.stepIndex > maxBrainDisplayableIdx {
 			maxBrainDisplayableIdx = step.stepIndex
 		}
 		merged = append(merged, msg)
 	}
+	for i, stepIdx := range dbResult.usageEventStepIndices {
+		if i >= len(dbResult.usageEvents) || dbResult.usageEvents[i].OccurredAt != "" {
+			continue
+		}
+		if ts, ok := brainTimestampByIdx[stepIdx]; ok && !ts.IsZero() {
+			dbResult.usageEvents[i].OccurredAt = ts.Format(time.RFC3339Nano)
+		}
+	}
 	history := nonEmptyAntigravityHistoryMessages(historyMsgs)
 	covers := len(merged) > 0 && brainUserCount >= len(history)
 	for _, dbStep := range dbResult.steps {
-		if dbStep.decoded {
-			if _, ok := brainDisplayableByIdx[dbStep.idx]; !ok {
-				covers = false
+		if !isAntigravityBrainStepCovered(
+			dbStep, brainDisplayableRoleByIdx, maxBrainDisplayableIdx,
+		) {
+			covers = false
+			if dbStep.decoded {
 				merged = append(merged, dbStep.msg)
 			}
-		} else if dbStep.idx > maxBrainDisplayableIdx {
-			covers = false
 		}
 	}
 	merged = appendMissingAntigravityHistoryMessages(merged, history)
 	return merged, covers
+}
+
+func isAntigravityBrainStepCovered(
+	dbStep antigravityLoadedStep,
+	brainDisplayableRoleByIdx map[int]RoleType,
+	maxBrainDisplayableIdx int,
+) bool {
+	role, ok := brainDisplayableRoleByIdx[dbStep.idx]
+	switch dbStep.kind {
+	case antigravityStepKindUserInput:
+		return ok && role == RoleUser
+	case antigravityStepKindPlannerResponse:
+		return ok && role == RoleAssistant
+	default:
+		if ok {
+			return !dbStep.decoded || role == dbStep.msg.Role
+		}
+		if dbStep.decoded {
+			return false
+		}
+		return dbStep.idx <= maxBrainDisplayableIdx &&
+			isAntigravityNonTranscriptStepKind(dbStep.kind)
+	}
+}
+
+func isAntigravityNonTranscriptStepKind(kind antigravityStepKind) bool {
+	switch kind {
+	case antigravityStepKindCodeAction,
+		antigravityStepKindGrepSearch,
+		antigravityStepKindViewFile,
+		antigravityStepKindListDirectory,
+		antigravityStepKindRunCommand,
+		antigravityStepKindCheckpoint,
+		antigravityStepKindSystemMessage,
+		antigravityStepKindGeneric:
+		return true
+	default:
+		return false
+	}
 }
 
 func mergeAntigravityDBHistoryMessages(
@@ -596,34 +647,40 @@ func appendMissingAntigravityHistoryMessages(
 			})
 		}
 	}
-	out := dbMessages
-	for _, msg := range history {
+	matched := make([]bool, len(history))
+	for hIdx, msg := range history {
 		key := normalizedAntigravityPrompt(msg.Content)
 		if key == "" {
+			matched[hIdx] = true
 			continue
 		}
-		matched := false
-		if !msg.Timestamp.IsZero() {
-			wantUnix := msg.Timestamp.Unix()
-			for i := range existing {
-				if !existing[i].used && existing[i].key == key &&
-					existing[i].hasTS && existing[i].unix == wantUnix {
-					existing[i].used = true
-					matched = true
-					break
-				}
+		if msg.Timestamp.IsZero() {
+			continue
+		}
+		wantUnix := msg.Timestamp.Unix()
+		for i := range existing {
+			if !existing[i].used && existing[i].key == key &&
+				existing[i].hasTS && existing[i].unix == wantUnix {
+				existing[i].used = true
+				matched[hIdx] = true
+				break
 			}
 		}
-		if !matched {
-			for i := range existing {
-				if !existing[i].used && existing[i].key == key {
-					existing[i].used = true
-					matched = true
-					break
-				}
+	}
+	out := dbMessages
+	for hIdx, msg := range history {
+		if matched[hIdx] {
+			continue
+		}
+		key := normalizedAntigravityPrompt(msg.Content)
+		for i := range existing {
+			if !existing[i].used && existing[i].key == key {
+				existing[i].used = true
+				matched[hIdx] = true
+				break
 			}
 		}
-		if !matched {
+		if !matched[hIdx] {
 			out = append(out, msg)
 		}
 	}
