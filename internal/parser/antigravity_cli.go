@@ -121,8 +121,20 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 	// stays empty for legacy .pb and sidecar-only sessions where no schema
 	// is available, so SourceVersion is never fabricated.
 	var sourceVersion string
+	brainTranscriptMsgs, brainTranscriptErr := collectAntigravityBrainTranscriptMessages(
+		antigravityBrainTranscriptPath(root, id),
+	)
+	if brainTranscriptErr != nil && !os.IsNotExist(brainTranscriptErr) {
+		return nil, nil, nil, status, brainTranscriptErr
+	}
+	brainTranscriptOK := hasDisplayableAntigravityCLITrajectoryMessage(
+		brainTranscriptMsgs,
+	)
+
+	var dbErr error
 	if ext == ".db" {
-		dbResult, dbErr := loadAntigravityCLIDBSteps(ctx, path)
+		var dbResult antigravityStepLoadResult
+		dbResult, dbErr = loadAntigravityCLIDBSteps(ctx, path)
 		sourceVersion = dbResult.sourceVersion
 		hasGenMetadata = dbResult.hasGenMetadata
 		// gen_metadata token usage describes the session's actual
@@ -155,9 +167,15 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 			hasDisplayableAntigravityCLITrajectoryMessage(tRes.messages)
 		sidecarCovers := dbErr != nil || dbResult.rawStepCount == 0 ||
 			tRes.rawSteps >= dbResult.rawStepCount
+		brainTranscriptCovers := dbErr != nil || len(dbResult.messages) == 0 ||
+			len(brainTranscriptMsgs) >= len(dbResult.messages)
 		switch {
 		case sidecarOK && sidecarCovers:
 			messages = tRes.messages
+			hasTrajectory = true
+			transcriptFidelity = TranscriptFidelityFull
+		case brainTranscriptOK && brainTranscriptCovers:
+			messages = brainTranscriptMsgs
 			hasTrajectory = true
 			transcriptFidelity = TranscriptFidelityFull
 		case dbOK:
@@ -173,6 +191,10 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 			// available transcript but leave the row stale so the next
 			// pass re-parses once agy-reader catches up.
 			messages = tRes.messages
+			hasTrajectory = true
+			status.NeedsRetry = true
+		case brainTranscriptOK:
+			messages = brainTranscriptMsgs
 			hasTrajectory = true
 			status.NeedsRetry = true
 		case dbErr != nil || dbResult.rawStepCount > 0:
@@ -215,6 +237,11 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 				transcriptFidelity = TranscriptFidelityFull
 			}
 		}
+		if !hasTrajectory && brainTranscriptOK {
+			messages = brainTranscriptMsgs
+			hasTrajectory = true
+			transcriptFidelity = TranscriptFidelityFull
+		}
 	}
 
 	if !hasTrajectory {
@@ -236,6 +263,13 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 		if extra, ok := decryptAntigravityCLITranscript(path); ok {
 			messages = append(messages, extra)
 		}
+	}
+
+	if ext == ".db" && dbErr != nil && len(messages) == 0 && len(usageEvents) == 0 {
+		// Fail closed when the SQLite database could not be read and no
+		// fallback source supplied messages or usage events, so sync does
+		// not clobber a previously stored transcript with an empty session.
+		return nil, nil, nil, status, dbErr
 	}
 
 	sort.SliceStable(messages, func(i, j int) bool {
@@ -384,7 +418,29 @@ func normalizeAntigravityCLIWorkspace(workspace string) string {
 func loadAntigravityCLIDBSteps(ctx context.Context,
 	path string,
 ) (antigravityStepLoadResult, error) {
-	db, err := openSQLiteReadOnly(path, sqliteReadOptions{})
+	result, err := loadAntigravityCLIDBStepsWithOptions(
+		ctx, path, sqliteReadOptions{},
+	)
+	if err != nil {
+		// When a WAL database has been cleanly checkpointed and closed by
+		// agy (unlinking .db-shm) on a read-only filesystem mount, SQLite
+		// cannot create the shared-memory index in mode=ro and fails with
+		// SQLITE_CANTOPEN. Retry once with immutable=1 (stableSnapshot).
+		if retry, retryErr := loadAntigravityCLIDBStepsWithOptions(
+			ctx, path, sqliteReadOptions{stableSnapshot: true},
+		); retryErr == nil {
+			return retry, nil
+		}
+	}
+	return result, err
+}
+
+func loadAntigravityCLIDBStepsWithOptions(
+	ctx context.Context,
+	path string,
+	opts sqliteReadOptions,
+) (antigravityStepLoadResult, error) {
+	db, err := openSQLiteReadOnly(path, opts)
 	if err != nil {
 		return antigravityStepLoadResult{}, fmt.Errorf(
 			"open antigravity cli db %s: %w", path, err,
@@ -825,18 +881,20 @@ func antigravityCLICompanionPaths(path string) []string {
 	root := filepath.Dir(filepath.Dir(path))
 	historyPath := filepath.Join(root, "history.jsonl")
 	if base, ok := strings.CutSuffix(path, ".db"); ok {
-		// The trajectory sidecar is a transcript source for .db sessions
-		// too, so an agy-reader sync must change the fingerprint even when
-		// the database files themselves are untouched. The -shm index is
-		// left out because the parse's own read-only open rewrites it; see
-		// sqliteDBJournalSuffixes.
+		id := filepath.Base(base)
+		// The trajectory sidecar and brain transcript are transcript sources
+		// for .db sessions too, so their updates must change the fingerprint
+		// even when the database files themselves are untouched. The -shm
+		// index is left out because the parse's own read-only open rewrites
+		// it; see sqliteDBJournalSuffixes.
 		companions := []string{
 			historyPath,
 			path + "-wal",
 			base + ".trajectory.json",
+			antigravityBrainTranscriptPath(root, id),
 		}
 		return append(companions, antigravityBrainCompanions(
-			filepath.Join(root, "brain", filepath.Base(base)),
+			filepath.Join(root, "brain", id),
 		)...)
 	}
 
@@ -844,6 +902,7 @@ func antigravityCLICompanionPaths(path string) []string {
 	companions := []string{
 		historyPath,
 		strings.TrimSuffix(path, ".pb") + ".trajectory.json",
+		antigravityBrainTranscriptPath(root, id),
 	}
 	return append(companions, antigravityBrainCompanions(
 		filepath.Join(root, "brain", id),

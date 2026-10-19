@@ -106,22 +106,10 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
 	}
 	root := filepath.Dir(filepath.Dir(path))
 
-	// Open read-only; SQLite session files have WAL/SHM
-	// sidecars that the driver expects in the same dir.
-	db, err := openSQLiteReadOnly(path, sqliteReadOptions{})
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf(
-			"open antigravity db %s: %w", path, err,
-		)
-	}
-	defer db.Close()
-
-	// Schema-fingerprint label for the producing agy build. Computed from
-	// the open DB so IDE and CLI classify identically; empty when the
-	// schema cannot be read.
-	sourceVersion := antigravitySourceVersion(ctx, db)
-
-	dbResult, err := loadAntigravityStepsWithRawCount(ctx, db)
+	// Open read-only (falling back to immutable=1 when a checkpointed WAL DB
+	// lives on a read-only mount without a .db-shm file).
+	dbResult, err := loadAntigravityCLIDBSteps(ctx, path)
+	sourceVersion := dbResult.sourceVersion
 	if err != nil {
 		// Fail closed on an unreadable steps table, deliberately: a
 		// covering sidecar cannot rescue an unreadable DB because
