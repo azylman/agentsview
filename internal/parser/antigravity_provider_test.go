@@ -1341,22 +1341,26 @@ func TestAntigravityProvidersReadOnlyCheckpointedWAL(t *testing.T) {
 
 func TestAntigravityCLIBrainTranscriptAndFailClosed(t *testing.T) {
 	const id = "99999999-aaaa-bbbb-cccc-dddddddddddd"
-	fullBrainLine := `{"step_index":0,"type":"USER_INPUT","created_at":"2026-10-19T10:00:00Z","content":"Check deployment"}` + "\n" +
-		`{"step_index":1,"type":"PLANNER_RESPONSE","created_at":"2026-10-19T10:00:05Z","content":"Healthy.","thinking":"Checking","tool_calls":[{"id":"c1","name":"list_jobs","args":{}}]}` + "\n"
-	laggingBrainLine := `{"step_index":0,"type":"USER_INPUT","created_at":"2026-10-19T10:00:00Z","content":"Check deployment"}` + "\n" +
-		`{"step_index":1,"type":"SYSTEM","created_at":"2026-10-19T10:00:01Z"}` + "\n"
+	fullBrainLine := `{"step_index":0,"type":"USER_INPUT","created_at":"2026-05-17T06:40:00Z","content":"Check deployment"}` + "\n" +
+		`{"step_index":1,"type":"PLANNER_RESPONSE","created_at":"2026-05-17T06:41:40Z","content":"Healthy.","thinking":"Checking","tool_calls":[{"id":"c1","name":"list_jobs","args":{}}]}` + "\n"
+	laggingBrainLine := `{"step_index":0,"type":"USER_INPUT","created_at":"2026-05-17T06:40:00Z","content":"Check deployment"}` + "\n" +
+		`{"step_index":1,"type":"SYSTEM","created_at":"2026-05-17T06:40:01Z"}` + "\n"
+	assistantOnlyBrainLine := `{"step_index":1,"type":"PLANNER_RESPONSE","created_at":"2026-05-17T06:41:40Z","content":"Healthy.","thinking":"Checking","tool_calls":[{"id":"c1","name":"list_jobs","args":{}}]}` + "\n"
 	tests := []struct {
-		name         string
-		corruptDB    bool
-		transcript   string
-		wantErr      bool
-		wantVersion  DataVersionState
-		wantThinking bool
-		wantContent  string
+		name             string
+		corruptDB        bool
+		undecodableSteps bool
+		historyPrompt    string
+		transcript       string
+		wantErr          bool
+		wantVersion      DataVersionState
+		wantThinking     bool
+		wantContent      string
 	}{
-		{"brain transcript wins and preserves gen_metadata usage", false, fullBrainLine, false, DataVersionCurrent, true, "Healthy."},
-		{"lagging brain transcript keeps uncovered db step and retries", false, laggingBrainLine, false, DataVersionNeedsRetry, false, "assistant reply content body"},
-		{"unreadable db with stale brain transcript fails closed", true, fullBrainLine, true, DataVersionCurrent, false, ""},
+		{"brain transcript wins and preserves gen_metadata usage", false, false, "", fullBrainLine, false, DataVersionCurrent, true, "Healthy."},
+		{"lagging brain transcript keeps uncovered db step and retries", false, false, "", laggingBrainLine, false, DataVersionNeedsRetry, false, "assistant reply content body"},
+		{"assistant-only brain transcript with undecodable db steps merges history and preserves gen_metadata", false, true, "Check deployment", assistantOnlyBrainLine, false, DataVersionNeedsRetry, true, "Healthy."},
+		{"unreadable db with stale brain transcript fails closed", true, false, "", fullBrainLine, true, DataVersionCurrent, false, ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1369,10 +1373,17 @@ func TestAntigravityCLIBrainTranscriptAndFailClosed(t *testing.T) {
 				createAntigravityTestDB(t, dbPath)
 				db, err := sql.Open("sqlite3", dbPath)
 				require.NoError(t, err)
+				if tc.undecodableSteps {
+					mustExec(t, db, `UPDATE steps SET step_payload = X'00'`)
+				}
 				mustExec(t, db, `CREATE TABLE gen_metadata (idx integer, data blob, size integer, PRIMARY KEY (idx))`)
 				genData := createAntigravityMockGenMetadata(t, 2400, 180, 0, "Test Gemini 3.5")
 				mustExec(t, db, `INSERT INTO gen_metadata (idx, data, size) VALUES (1, ?, ?)`, genData, len(genData))
 				require.NoError(t, db.Close())
+			}
+			if tc.historyPrompt != "" {
+				historyRow := `{"conversationId":"` + id + `","timestamp":1779000000000,"display":"` + tc.historyPrompt + `"}` + "\n"
+				mustWrite(t, filepath.Join(root, "history.jsonl"), []byte(historyRow))
 			}
 			tp := antigravityBrainTranscriptPath(root, id)
 			mustMkdir(t, filepath.Dir(tp))
@@ -1390,6 +1401,7 @@ func TestAntigravityCLIBrainTranscriptAndFailClosed(t *testing.T) {
 			assert.Equal(t, tc.wantVersion, outcome.Results[0].DataVersion)
 			res := outcome.Results[0].Result
 			require.Len(t, res.Messages, 2)
+			assert.Equal(t, "Check deployment", res.Messages[0].Content)
 			assert.Contains(t, res.Messages[1].Content, tc.wantContent)
 			assert.Equal(t, tc.wantThinking, res.Messages[1].HasThinking)
 			assert.Equal(t, "Test Gemini 3.5", res.Messages[1].Model)
