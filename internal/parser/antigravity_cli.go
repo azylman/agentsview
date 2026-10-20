@@ -611,11 +611,20 @@ func mergeAntigravityCLIBrainTranscript(
 			dbStep, brainDisplayableRoleByIdx, maxBrainDisplayableIdx,
 		) {
 			covers = false
-			if sMsgs, ok := sidecarMsgsByIdx[dbStep.idx]; ok {
+			if sMsgs, ok := sidecarMsgsByIdx[dbStep.idx]; ok &&
+				hasDisplayableAntigravityCLITrajectoryMessage(sMsgs) {
 				merged = append(merged, sMsgs...)
 				sidecarUsedIdx[dbStep.idx] = true
-			} else if dbStep.decoded {
-				merged = append(merged, dbStep.msg)
+			} else {
+				if dbStep.decoded {
+					merged = append(merged, dbStep.msg)
+				}
+				for _, sMsg := range sidecarMsgsByIdx[dbStep.idx] {
+					if len(sMsg.ToolResults) > 0 {
+						merged = append(merged, sMsg)
+					}
+				}
+				sidecarUsedIdx[dbStep.idx] = true
 			}
 		}
 	}
@@ -627,7 +636,12 @@ func mergeAntigravityCLIBrainTranscript(
 			continue
 		}
 		covers = false
-		merged = append(merged, sidecarMsgsByIdx[sIdx]...)
+		for _, sMsg := range sidecarMsgsByIdx[sIdx] {
+			if hasDisplayableAntigravityCLITrajectoryMessage([]ParsedMessage{sMsg}) ||
+				len(sMsg.ToolResults) > 0 {
+				merged = append(merged, sMsg)
+			}
+		}
 	}
 	merged = appendMissingAntigravityHistoryMessages(merged, history)
 	return merged, covers
@@ -643,14 +657,15 @@ func mergeAntigravityPlannerToolCalls(
 		return slices.Clone(sidecarCalls)
 	}
 	out := slices.Clone(brainCalls)
-	matchedBrain := make([]bool, len(out))
+	brainLen := len(out)
+	matchedBrain := make([]bool, brainLen)
 	for sIdx, sc := range sidecarCalls {
 		bIdx := -1
-		if sIdx < len(out) && !matchedBrain[sIdx] &&
+		if sIdx < brainLen && !matchedBrain[sIdx] &&
 			(out[sIdx].ToolName == sc.ToolName || out[sIdx].ToolName == "") {
 			bIdx = sIdx
 		} else {
-			for i := range out {
+			for i := range brainLen {
 				if !matchedBrain[i] && out[i].ToolName == sc.ToolName {
 					bIdx = i
 					break
@@ -708,8 +723,9 @@ func reconcileAntigravityDBStepsWithHistory(
 		}
 		return out
 	}
+	matchedStep := make([]bool, len(userStepPositions))
 	matchedHistory := make([]bool, len(history))
-	for _, pos := range userStepPositions {
+	for uIdx, pos := range userStepPositions {
 		if !out[pos].decoded || out[pos].msg.Timestamp.IsZero() {
 			continue
 		}
@@ -717,6 +733,7 @@ func reconcileAntigravityDBStepsWithHistory(
 		for hIdx, hMsg := range history {
 			if !matchedHistory[hIdx] && !hMsg.Timestamp.IsZero() &&
 				hMsg.Timestamp.UnixMilli() == wantMilli {
+				matchedStep[uIdx] = true
 				matchedHistory[hIdx] = true
 				out[pos].msg.Content = hMsg.Content
 				out[pos].msg.ContentLength = len(hMsg.Content)
@@ -725,12 +742,26 @@ func reconcileAntigravityDBStepsWithHistory(
 			}
 		}
 	}
-	for _, pos := range userStepPositions {
-		if !out[pos].decoded || out[pos].msg.Timestamp.IsZero() ||
+	for uIdx, pos := range userStepPositions {
+		if matchedStep[uIdx] || !out[pos].decoded ||
+			out[pos].msg.Timestamp.IsZero() ||
 			out[pos].msg.Timestamp.Nanosecond() != 0 {
 			continue
 		}
 		wantSec := out[pos].msg.Timestamp.Unix()
+		ambiguousStep := false
+		for otherIdx, otherPos := range userStepPositions {
+			if otherIdx != uIdx && !matchedStep[otherIdx] &&
+				out[otherPos].decoded && !out[otherPos].msg.Timestamp.IsZero() &&
+				out[otherPos].msg.Timestamp.Nanosecond() == 0 &&
+				out[otherPos].msg.Timestamp.Unix() == wantSec {
+				ambiguousStep = true
+				break
+			}
+		}
+		if ambiguousStep {
+			continue
+		}
 		matchIdx := -1
 		for hIdx, hMsg := range history {
 			if matchedHistory[hIdx] || hMsg.Timestamp.IsZero() ||
@@ -744,6 +775,7 @@ func reconcileAntigravityDBStepsWithHistory(
 			matchIdx = hIdx
 		}
 		if matchIdx >= 0 {
+			matchedStep[uIdx] = true
 			matchedHistory[matchIdx] = true
 			out[pos].msg.Content = history[matchIdx].Content
 			out[pos].msg.ContentLength = len(history[matchIdx].Content)

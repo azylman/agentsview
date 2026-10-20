@@ -1360,14 +1360,24 @@ func TestAntigravityCLIBrainTranscriptAndFailClosed(t *testing.T) {
 		`{"type":"CORTEX_STEP_TYPE_USER_INPUT","status":"STATUS_COMPLETED","metadata":{"createdAt":"2026-05-17T06:40:00Z"},"userInput":{"userResponse":"Check deployment"}},` +
 		`{"type":"CORTEX_STEP_TYPE_PLANNER_RESPONSE","status":"STATUS_COMPLETED","metadata":{"createdAt":"2026-05-17T06:41:40Z"},"plannerResponse":{"response":"Partial sidecar reply"}}` +
 		`]}`
+	emptyPlannerSidecarJSON := `{"trajectoryId":"t1","cascadeId":"` + id + `","steps":[` +
+		`{"type":"CORTEX_STEP_TYPE_USER_INPUT","status":"STATUS_COMPLETED","metadata":{"createdAt":"2026-05-17T06:40:00Z"},"userInput":{"userResponse":"Check deployment"}},` +
+		`{"type":"CORTEX_STEP_TYPE_PLANNER_RESPONSE","status":"STATUS_COMPLETED","metadata":{"createdAt":"2026-05-17T06:41:40Z"},"plannerResponse":{}}` +
+		`]}`
 	partialToolSidecarJSON := `{"trajectoryId":"t1","cascadeId":"` + id + `","steps":[` +
 		`{"type":"CORTEX_STEP_TYPE_USER_INPUT","status":"STATUS_COMPLETED","metadata":{"createdAt":"2026-05-17T06:40:00Z"},"userInput":{"userResponse":"Check deployment"}},` +
-		`{"type":"CORTEX_STEP_TYPE_PLANNER_RESPONSE","status":"STATUS_COMPLETED","metadata":{"createdAt":"2026-05-17T06:41:40Z"},"plannerResponse":{"response":"Healthy.","toolCalls":[{"id":"c1","name":"run_command","argumentsJson":"{\"CommandLine\":\"nomad job status\"}"}]}},` +
+		`{"type":"CORTEX_STEP_TYPE_PLANNER_RESPONSE","status":"STATUS_COMPLETED","metadata":{"createdAt":"2026-05-17T06:41:40Z"},"plannerResponse":{"response":"Healthy.","toolCalls":[` +
+		`{"id":"c1","name":"run_command","argumentsJson":"{\"CommandLine\":\"nomad job status\"}"},` +
+		`{"id":"c2","name":"view_file","argumentsJson":"{\"AbsolutePathURI\":\"file:///tmp/a.go\"}"},` +
+		`{"id":"c3","name":"grep_search","argumentsJson":"{\"Query\":\"main\"}"}` +
+		`]}},` +
 		`{"type":"CORTEX_STEP_TYPE_RUN_COMMAND","status":"STATUS_COMPLETED","metadata":{"createdAt":"2026-05-17T06:41:41Z","executionId":"c1"},"runCommand":{"commandLine":"nomad job status","combinedOutput":"status = running"}}` +
 		`]}`
 	singleHistory := `{"conversationId":"` + id + `","timestamp":1779000000000,"display":"Check deployment"}` + "\n"
 	repeatedHistory := `{"conversationId":"` + id + `","timestamp":1779000000100,"display":"Check deployment"}` + "\n" +
 		`{"conversationId":"` + id + `","timestamp":1779000000500,"display":"Check deployment"}` + "\n"
+	sameSecondExactAndSubsecHistory := `{"conversationId":"` + id + `","timestamp":1779000000000,"display":"First prompt"}` + "\n" +
+		`{"conversationId":"` + id + `","timestamp":1779000000500,"display":"Second prompt"}` + "\n"
 	matchingDBHistory := `{"conversationId":"` + id + `","timestamp":1779000000000,"display":"user prompt text goes here"}` + "\n"
 	tests := []struct {
 		name             string
@@ -1394,6 +1404,7 @@ func TestAntigravityCLIBrainTranscriptAndFailClosed(t *testing.T) {
 		{"brain transcript with trailing undecodable non-transcript db step retries", ".db", false, false, 0, 21, false, "", "", fullBrainLine, false, DataVersionNeedsRetry, 2, "Check deployment", true, "Healthy.", ""},
 		{"displayable system brain step covers decoded sqlite system_message step without duplication", ".db", false, false, 0, 0, true, "", "", fullWithSystemBrainLine, false, DataVersionCurrent, 3, "Check deployment", true, "Healthy.", ""},
 		{"incomplete brain transcript preserves readable step from partial trajectory sidecar", ".db", false, true, 0, 15, false, incompleteSidecarJSON, "", userOnlyBrainLine, false, DataVersionNeedsRetry, 2, "Check deployment", false, "Partial sidecar reply", ""},
+		{"empty sidecar planner step does not clobber decoded uncovered db reply", ".db", false, false, 0, 15, false, emptyPlannerSidecarJSON, "", userOnlyBrainLine, false, DataVersionNeedsRetry, 2, "Check deployment", false, "assistant reply content body", ""},
 		{"partial sidecar with tool calls and results preserves tool output alongside matching brain entries", ".db", false, false, 0, 21, false, partialToolSidecarJSON, "", fullNoToolIDBrainLine, false, DataVersionNeedsRetry, 3, "Check deployment", true, "Healthy.", `"status = running"`},
 		{"lagging brain transcript keeps uncovered db step and retries", ".db", false, false, 0, 0, false, "", "", laggingBrainLine, false, DataVersionNeedsRetry, 2, "Check deployment", false, "assistant reply content body", ""},
 		{"assistant-only brain transcript with undecodable db user step and no history retries", ".db", false, true, 0, 0, false, "", "", assistantOnlyBrainLine, false, DataVersionNeedsRetry, 1, "Healthy.", true, "Healthy.", ""},
@@ -1401,6 +1412,7 @@ func TestAntigravityCLIBrainTranscriptAndFailClosed(t *testing.T) {
 		{"assistant-only brain transcript with decoded db user step reconciles authoritative history text without duplication", ".db", false, false, 0, 0, false, "", singleHistory, assistantOnlyBrainLine, false, DataVersionNeedsRetry, 2, "Check deployment", true, "Healthy.", ""},
 		{"assistant-only brain transcript with repeated history prompts preserves all occurrences", ".db", false, true, 0, 0, false, "", repeatedHistory, assistantOnlyBrainLine, false, DataVersionNeedsRetry, 3, "Check deployment", true, "Healthy.", ""},
 		{"repeated history prompts within same second with only later transcript turn present preserves earlier turn", ".db", false, true, 0, 0, false, "", repeatedHistory, laterTurnBrainLine, false, DataVersionNeedsRetry, 3, "Check deployment", true, "Healthy.", ""},
+		{"same-second history prompts do not overwrite exact whole-second decoded db user step", ".db", false, false, 0, 0, false, "", sameSecondExactAndSubsecHistory, assistantOnlyBrainLine, false, DataVersionNeedsRetry, 3, "First prompt", true, "Healthy.", ""},
 		{"decoded db user step absent from brain transcript is not duplicated by history", ".db", false, false, 0, 0, false, "", matchingDBHistory, assistantOnlyBrainLine, false, DataVersionNeedsRetry, 2, "user prompt text goes here", true, "Healthy.", ""},
 		{"pb assistant-only brain transcript merges history and retries", ".pb", false, false, 0, 0, false, "", singleHistory, assistantOnlyBrainLine, false, DataVersionNeedsRetry, 2, "Check deployment", true, "Healthy.", ""},
 		{"unreadable db with stale brain transcript fails closed", ".db", true, false, 0, 0, false, "", "", fullBrainLine, true, DataVersionCurrent, 0, "", false, "", ""},
@@ -1476,13 +1488,21 @@ func TestAntigravityCLIBrainTranscriptAndFailClosed(t *testing.T) {
 				assert.Equal(t, int64(1779000000100), res.Messages[0].Timestamp.UnixMilli())
 				assert.Equal(t, int64(1779000000500), res.Messages[1].Timestamp.UnixMilli())
 			}
+			if tc.historyJSONL == sameSecondExactAndSubsecHistory {
+				assert.Equal(t, "First prompt", res.Messages[0].Content)
+				assert.Equal(t, int64(1779000000000), res.Messages[0].Timestamp.UnixMilli())
+				assert.Equal(t, "Second prompt", res.Messages[1].Content)
+				assert.Equal(t, int64(1779000000500), res.Messages[1].Timestamp.UnixMilli())
+			}
 			if tc.decodedSysStep {
 				assert.Equal(t, RoleSystem, res.Messages[1].Role)
 				assert.Equal(t, "system maintenance notice goes here", res.Messages[1].Content)
 			}
 			if tc.wantToolResult != "" {
-				require.Len(t, res.Messages[1].ToolCalls, 1)
+				require.Len(t, res.Messages[1].ToolCalls, 3)
 				assert.Equal(t, "c1", res.Messages[1].ToolCalls[0].ToolUseID)
+				assert.Equal(t, "c2", res.Messages[1].ToolCalls[1].ToolUseID)
+				assert.Equal(t, "c3", res.Messages[1].ToolCalls[2].ToolUseID)
 				require.Len(t, res.Messages[2].ToolResults, 1)
 				assert.Equal(t, "c1", res.Messages[2].ToolResults[0].ToolUseID)
 				assert.Equal(t, tc.wantToolResult, res.Messages[2].ToolResults[0].ContentRaw)
