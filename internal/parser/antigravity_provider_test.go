@@ -1358,13 +1358,16 @@ func TestAntigravityCLIBrainTranscriptAndFailClosed(t *testing.T) {
 				require.NoError(t, err)
 				mustExec(t, db, `CREATE TABLE gen_metadata (idx integer, data blob, size integer, PRIMARY KEY (idx))`)
 				genData := createAntigravityMockGenMetadata(t, 2400, 180, 0, "Test Gemini 3.5")
-				mustExec(t, db, `INSERT INTO gen_metadata (idx, data, size) VALUES (2, ?, ?)`, genData, len(genData))
+				// The planner row is undecodable, so its usage event takes
+				// the brain transcript's timestamp for the same step.
+				mustExec(t, db, `UPDATE steps SET step_type = 15, step_payload = X'00' WHERE idx = 1`)
+				mustExec(t, db, `INSERT INTO gen_metadata (idx, data, size) VALUES (1, ?, ?)`, genData, len(genData))
 				require.NoError(t, db.Close())
 				tp := antigravityBrainTranscriptPath(root, id)
 				mustMkdir(t, filepath.Dir(tp))
 				mustWrite(t, tp, []byte(
-					`{"step_index":1,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"2026-10-19T10:00:00Z","content":"Check deployment"}`+"\n"+
-						`{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"2026-10-19T10:00:05Z","content":"Healthy.","thinking":"Checking","tool_calls":[{"id":"c1","name":"list_jobs","args":{}}]}`+"\n",
+					`{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"2026-10-19T10:00:00Z","content":"Check deployment"}`+"\n"+
+						`{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"2026-10-19T10:00:05Z","content":"Healthy.","thinking":"Checking","tool_calls":[{"id":"c1","name":"list_jobs","args":{}}]}`+"\n",
 				))
 			}
 			provider, _ := NewProvider(AgentAntigravityCLI, ProviderConfig{Roots: []string{root}, Machine: "devbox"})
@@ -1389,4 +1392,202 @@ func TestAntigravityCLIBrainTranscriptAndFailClosed(t *testing.T) {
 			assert.Equal(t, "2026-10-19T10:00:05Z", res.UsageEvents[0].OccurredAt)
 		})
 	}
+}
+
+// antigravityCLIBrainFixture describes one CLI conversation. A nil setupDB
+// writes an unreadable .db, and pb writes an encrypted .pb stand-in instead.
+type antigravityCLIBrainFixture struct {
+	pb         bool
+	setupDB    func(t *testing.T, db *sql.DB)
+	transcript string
+	history    string
+	sidecar    string
+}
+
+// write lays out the fixture under a fresh root and returns the session path.
+func (f antigravityCLIBrainFixture) write(t *testing.T, id string) string {
+	t.Helper()
+	root := t.TempDir()
+	mustMkdir(t, filepath.Join(root, "conversations"))
+	path := filepath.Join(root, "conversations", id+".db")
+	switch {
+	case f.pb:
+		path = filepath.Join(root, "conversations", id+".pb")
+		mustWrite(t, path, []byte("encrypted-pb-placeholder"))
+	case f.setupDB == nil:
+		mustWrite(t, path, []byte("not-a-sqlite-database"))
+	default:
+		db, err := sql.Open("sqlite3", path)
+		require.NoError(t, err)
+		createAntigravityStepTables(t, db)
+		f.setupDB(t, db)
+		require.NoError(t, db.Close())
+	}
+	if f.transcript != "" {
+		tp := antigravityBrainTranscriptPath(root, id)
+		mustMkdir(t, filepath.Dir(tp))
+		mustWrite(t, tp, []byte(f.transcript))
+	}
+	if f.history != "" {
+		mustWrite(t, filepath.Join(root, "history.jsonl"), []byte(f.history))
+	}
+	if f.sidecar != "" {
+		sidecarPath := strings.TrimSuffix(path, filepath.Ext(path)) + ".trajectory.json"
+		mustWrite(t, sidecarPath, []byte(f.sidecar))
+	}
+	return path
+}
+
+func antigravityTestStepPayload(unix uint64, text string) []byte {
+	ts := encodePB([]pbField{{num: 1, wire: pbWireVarint, varint: unix}})
+	return encodePB([]pbField{
+		{num: 5, wire: pbWireBytes, bytes: ts},
+		{num: 17, wire: pbWireBytes, bytes: []byte(text)},
+	})
+}
+
+func TestAntigravityCLIBrainTranscriptSourceSelection(t *testing.T) {
+	const id = "99999999-aaaa-bbbb-cccc-dddddddddddd"
+	const coveringSidecar = `{"steps":[
+		{"type":"CORTEX_STEP_TYPE_USER_INPUT","metadata":{"createdAt":"2026-05-17T06:40:00Z"},"userInput":{"userResponse":"Check deployment"}},
+		{"type":"CORTEX_STEP_TYPE_PLANNER_RESPONSE","metadata":{"createdAt":"2026-05-17T06:41:00Z"},"plannerResponse":{"response":"sidecar reply body"}}
+	]}`
+	undecodableSteps := func(kinds ...int) func(*testing.T, *sql.DB) {
+		return func(t *testing.T, db *sql.DB) {
+			for idx, kind := range kinds {
+				mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, X'00')`, idx, kind)
+			}
+		}
+	}
+	decodedSteps := func(t *testing.T, db *sql.DB) {
+		mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (0, 14, ?)`,
+			antigravityTestStepPayload(1779000000, "user prompt text goes here"))
+		mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (1, 17, ?)`,
+			antigravityTestStepPayload(1779000100, "assistant reply content body"))
+	}
+	userLine := `{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"2026-05-17T06:40:00Z","content":"Check deployment"}` + "\n"
+	assistantLine := `{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"2026-05-17T06:41:40Z","content":"Healthy."}` + "\n"
+	history := `{"conversationId":"` + id + `","timestamp":1779000000000,"display":"Check deployment"}` + "\n"
+
+	tests := []struct {
+		name           string
+		fixture        antigravityCLIBrainFixture
+		wantErr        bool
+		wantNeedsRetry bool
+		wantContents   []string
+		wantUnixMilli  []int64
+	}{
+		{
+			name:         "unreadable db keeps covering sidecar when a brain transcript exists",
+			fixture:      antigravityCLIBrainFixture{transcript: userLine, sidecar: coveringSidecar},
+			wantContents: []string{"Check deployment", "sidecar reply body"},
+		},
+		{
+			name:           "unreadable db falls back to brain transcript and retries",
+			fixture:        antigravityCLIBrainFixture{transcript: assistantLine, history: history},
+			wantNeedsRetry: true,
+			wantContents:   []string{"Check deployment", "Healthy."},
+		},
+		{
+			name:    "unreadable db without any fallback fails closed",
+			fixture: antigravityCLIBrainFixture{},
+			wantErr: true,
+		},
+		{
+			name: "partial sidecar beats a partial brain transcript",
+			fixture: antigravityCLIBrainFixture{
+				setupDB: undecodableSteps(14, 15, 15), transcript: userLine, sidecar: coveringSidecar,
+			},
+			wantNeedsRetry: true,
+			wantContents:   []string{"Check deployment", "sidecar reply body"},
+		},
+		{
+			name: "empty brain entries do not replace a decoded db reply",
+			fixture: antigravityCLIBrainFixture{
+				setupDB: decodedSteps,
+				transcript: userLine +
+					`{"step_index":1,"source":"SYSTEM","type":"CONVERSATION_HISTORY","created_at":"2026-05-17T06:40:01Z"}` + "\n" +
+					`{"step_index":2,"source":"SYSTEM","type":"CONVERSATION_HISTORY","created_at":"2026-05-17T06:40:02Z"}` + "\n",
+			},
+			wantContents: []string{"user prompt text goes here", "assistant reply content body"},
+		},
+		{
+			name: "system brain step covers a decoded db step of another role",
+			fixture: antigravityCLIBrainFixture{
+				setupDB: decodedSteps,
+				transcript: userLine +
+					`{"step_index":1,"source":"SYSTEM","type":"SYSTEM_MESSAGE","created_at":"2026-05-17T06:41:40Z","content":"assistant reply content body"}` + "\n",
+			},
+			wantContents: []string{"Check deployment", "assistant reply content body"},
+		},
+		{
+			name: "partial brain transcript keeps repeated history prompts within one second",
+			fixture: antigravityCLIBrainFixture{
+				setupDB: undecodableSteps(14, 15, 14, 15),
+				transcript: `{"step_index":2,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"2026-05-17T06:40:00.900Z","content":"Check deployment"}` + "\n" +
+					`{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"2026-05-17T06:40:30Z","content":"Healthy."}` + "\n",
+				history: `{"conversationId":"` + id + `","timestamp":1779000000100,"display":"Check deployment"}` + "\n" +
+					`{"conversationId":"` + id + `","timestamp":1779000000900,"display":"Check deployment"}` + "\n",
+			},
+			wantNeedsRetry: true,
+			wantContents:   []string{"Check deployment", "Check deployment", "Healthy."},
+			wantUnixMilli:  []int64{1779000000100, 1779000000900, 1779000030000},
+		},
+		{
+			name:         "pb assistant-only brain transcript keeps history prompts",
+			fixture:      antigravityCLIBrainFixture{pb: true, transcript: assistantLine, history: history},
+			wantContents: []string{"Check deployment", "Healthy."},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := tc.fixture.write(t, id)
+			_, msgs, _, status, err := parseAntigravityCLITestSessionWithStatus(
+				t, path, "", "devbox",
+			)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantNeedsRetry, status.NeedsRetry)
+			var contents []string
+			var unixMilli []int64
+			for _, m := range msgs {
+				contents = append(contents, m.Content)
+				unixMilli = append(unixMilli, m.Timestamp.UnixMilli())
+			}
+			assert.Equal(t, tc.wantContents, contents)
+			if tc.wantUnixMilli != nil {
+				assert.Equal(t, tc.wantUnixMilli, unixMilli)
+			}
+		})
+	}
+}
+
+// A generation whose planner step has not been written yet must not attach
+// its tokens or model to the decoded user step it also lists.
+func TestAntigravityGenMetadataDoesNotAttachToNonPlannerStep(t *testing.T) {
+	const id = "99999999-aaaa-bbbb-cccc-dddddddddddd"
+	path := antigravityCLIBrainFixture{setupDB: func(t *testing.T, db *sql.DB) {
+		mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (0, 14, ?)`,
+			antigravityTestStepPayload(1779000000, "user prompt text goes here"))
+		mustExec(t, db, `CREATE TABLE gen_metadata (idx integer, data blob, size integer, PRIMARY KEY (idx))`)
+		genData := createAntigravityMockGenMetadataForSteps(
+			t, 2400, 180, 0, "Test Gemini 3.5", agChatModelMetadataModelDisplayNameField, 0, 1,
+		)
+		mustExec(t, db, `INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?, ?)`, genData, len(genData))
+	}}.write(t, id)
+
+	_, msgs, usageEvents, _, err := parseAntigravityCLITestSessionWithStatus(
+		t, path, "", "devbox",
+	)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	assert.Equal(t, RoleUser, msgs[0].Role)
+	assert.Empty(t, msgs[0].Model)
+	assert.False(t, msgs[0].HasContextTokens)
+	assert.False(t, msgs[0].HasOutputTokens)
+	require.Len(t, usageEvents, 1)
+	assert.Equal(t, 2400, usageEvents[0].InputTokens)
 }

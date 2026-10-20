@@ -586,15 +586,15 @@ fixtures retain this field; missing identities remain source-local.
   [persistence policy](https://github.com/openai/codex/blob/c71297b9a9b3f7995445eff8d768837814ac06f8/codex-rs/core/src/rollout/policy.rs#L6-L15).
   Its
   [metadata schema](https://github.com/openai/codex/blob/c71297b9a9b3f7995445eff8d768837814ac06f8/codex-rs/protocol/src/protocol.rs#L971-L980)
-  has no `forked_from_id`. AgentsView keeps the first nonempty metadata ID and
-  ignores later metadata with a different or empty ID. Same-thread metadata can
-  still update the working directory and branch; existing fork replay filtering
-  and revert-page identities remain in effect. This establishes a producer path
-  for the shape reported in
+  has no `forked_from_id`. AgentsView keeps the first nonempty metadata ID
+  and ignores later metadata with a different or empty ID. Same-thread
+  metadata can still update the working directory and branch; existing fork
+  replay filtering and revert-page identities remain in effect. This
+  establishes a producer path for the shape reported in
   [issue #2248](https://github.com/kenn-io/agentsview/issues/2248); the
   particular file's history remains unverified.
-  `TestCodexMisfiledPageUpgradeRetainsTranscriptMetadata` verifies that a proven
-  page correction preserves transcript metadata during upgrade.
+  `TestCodexMisfiledPageUpgradeRetainsTranscriptMetadata` verifies that a
+  proven page correction preserves transcript metadata during upgrade.
 
 - **Compressed rollouts (checked 2026-10-16, source at commit
   `6b991972c5b539198dcea9bac4fc14e57559c3af`):** A background worker started
@@ -3932,20 +3932,24 @@ schemas keep their existing ordering behavior.
 - **Agentsview:** `internal/parser/antigravity_cli.go`,
   `internal/parser/antigravity_crypto.go`,
   `internal/parser/antigravity_brain_transcript.go`, and
-  `internal/parser/antigravity_cli_provider.go`. Plaintext brain transcripts at
-  `brain/<uuid>/.system_generated/logs/transcript.jsonl` are folded into CLI
-  sessions alongside `.db` `gen_metadata` token usage; checkpointed WAL
-  databases on read-only mounts without `.db-shm` or framed `-wal` sidecars fall
-  back to `immutable=1`, and unreadable databases fail closed without replacing
-  archived messages. The CLI `history.jsonl` `workspace` value and the current
-  CLI's `cache/last_conversations.json` workspace-to-conversation mapping are
+  `internal/parser/antigravity_cli_provider.go`. Plaintext brain transcripts
+  at `brain/<uuid>/.system_generated/logs/transcript.jsonl` are folded into
+  CLI sessions alongside `.db` `gen_metadata` token usage. A brain transcript
+  replaces the SQLite decode only when its `step_index` values reach the last
+  SQLite step and every decoded, user, or planner step has an entry at the
+  same index; otherwise it is a fallback, and `history.jsonl` prompts it lacks
+  are added back. Checkpointed WAL databases on read-only mounts without
+  `.db-shm` or framed `-wal` sidecars fall back to `immutable=1`. An
+  unreadable database with no fallback transcript or usage fails the parse.
+  The CLI `history.jsonl` `workspace` value and the current CLI's
+  `cache/last_conversations.json` workspace-to-conversation mapping are
   authoritative session CWD sources when the workspace is an absolute path.
   Agentsview prefers the first valid current-cache folder for an exact
   conversation ID, retains the strict prompt/time fallback for older untagged
-  history rows, and leaves CWD empty when the value is missing or relative. The
-  exact absolute workspace remains the CWD. The project label is derived from
-  the path text without probing the recorded folder when filesystem discovery is
-  disabled.
+  history rows, and leaves CWD empty when the value is missing or relative.
+  The exact absolute workspace remains the CWD. The project label is derived
+  from the path text without probing the recorded folder when filesystem
+  discovery is disabled.
 
 ## iFlow CLI (`iflow`)
 

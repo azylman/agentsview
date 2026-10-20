@@ -136,6 +136,9 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 		brainTranscriptMsgs,
 	)
 
+	historyMsgs := collectAntigravityHistoryMessages(
+		filepath.Join(root, "history.jsonl"), id,
+	)
 	var dbErr error
 	if ext == ".db" {
 		var dbResult antigravityStepLoadResult
@@ -177,8 +180,8 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 			hasDisplayableAntigravityCLITrajectoryMessage(tRes.messages)
 		sidecarCovers := dbErr != nil || dbResult.rawStepCount == 0 ||
 			tRes.rawSteps >= dbResult.rawStepCount
-		brainTranscriptCovers := dbErr == nil && (len(dbResult.messages) == 0 ||
-			len(brainTranscriptMsgs) >= len(dbResult.messages))
+		brainTranscriptCovers := dbErr == nil &&
+			antigravityBrainTranscriptCoversDB(brainTranscriptSteps, dbResult.steps)
 		switch {
 		case sidecarOK && sidecarCovers:
 			messages = tRes.messages
@@ -190,10 +193,7 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 			transcriptFidelity = TranscriptFidelityFull
 		case dbOK:
 			messages = mergeAntigravityDBHistoryMessages(
-				dbResult.messages,
-				collectAntigravityHistoryMessages(
-					filepath.Join(root, "history.jsonl"), id,
-				),
+				dbResult.messages, historyMsgs,
 			)
 			hasTrajectory = true
 		case sidecarOK:
@@ -204,7 +204,11 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 			hasTrajectory = true
 			status.NeedsRetry = true
 		case brainTranscriptOK:
-			messages = brainTranscriptMsgs
+			// A partial brain log can miss user turns that history.jsonl
+			// recorded, so fold those back in.
+			messages = appendMissingAntigravityHistoryMessages(
+				brainTranscriptMsgs, historyMsgs,
+			)
 			hasTrajectory = true
 			status.NeedsRetry = true
 		case dbErr != nil || dbResult.rawStepCount > 0:
@@ -248,16 +252,18 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 			}
 		}
 		if !hasTrajectory && brainTranscriptOK {
-			messages = brainTranscriptMsgs
+			// .pb sessions have no step rows to prove coverage, so history
+			// prompts the brain log missed are folded back in.
+			messages = appendMissingAntigravityHistoryMessages(
+				brainTranscriptMsgs, historyMsgs,
+			)
 			hasTrajectory = true
 			transcriptFidelity = TranscriptFidelityFull
 		}
 	}
 
 	if !hasTrajectory {
-		messages = collectAntigravityHistoryMessages(
-			filepath.Join(root, "history.jsonl"), id,
-		)
+		messages = historyMsgs
 	}
 	messages = append(
 		messages,
@@ -473,6 +479,38 @@ func loadAntigravityCLIDBStepsWithOptions(
 	return result, nil
 }
 
+// antigravityBrainTranscriptCoversDB reports whether the brain transcript
+// holds every SQLite step that has content. The log skips steps that logged
+// nothing, so it must reach the last step, and every decoded step and every
+// user or planner step must have a displayable entry at the same index.
+func antigravityBrainTranscriptCoversDB(
+	brainSteps []antigravityBrainTranscriptStep,
+	dbSteps []antigravityLoadedStep,
+) bool {
+	maxBrainIdx := -1
+	displayable := make(map[int]bool, len(brainSteps))
+	for _, bs := range brainSteps {
+		maxBrainIdx = max(maxBrainIdx, bs.stepIndex)
+		if hasDisplayableAntigravityCLITrajectoryMessage(
+			[]ParsedMessage{bs.msg},
+		) {
+			displayable[bs.stepIndex] = true
+		}
+	}
+	for _, step := range dbSteps {
+		if step.idx > maxBrainIdx {
+			return false
+		}
+		needsEntry := step.decoded ||
+			step.kind == antigravityStepKindUserInput ||
+			step.kind == antigravityStepKindPlannerResponse
+		if needsEntry && !displayable[step.idx] {
+			return false
+		}
+	}
+	return true
+}
+
 func applyAntigravityBrainStepMetadata(
 	brainSteps []antigravityBrainTranscriptStep,
 	dbResult antigravityStepLoadResult,
@@ -556,29 +594,65 @@ func mergeAntigravityDBHistoryMessages(
 	return dbMessages
 }
 
+// appendMissingAntigravityHistoryMessages appends history prompts that no
+// existing user turn accounts for. Repeated prompts are matched one to one:
+// first by exact timestamp, then by the same second (for sources that record
+// whole seconds), then by text alone, so each history row keeps its own turn.
 func appendMissingAntigravityHistoryMessages(
 	dbMessages []ParsedMessage, history []ParsedMessage,
 ) []ParsedMessage {
-	seen := make(map[string]struct{})
+	type existingUserTurn struct {
+		key  string
+		ts   time.Time
+		used bool
+	}
+	var existing []existingUserTurn
 	for _, msg := range dbMessages {
 		if msg.Role != RoleUser {
 			continue
 		}
 		if key := normalizedAntigravityPrompt(msg.Content); key != "" {
-			seen[key] = struct{}{}
+			existing = append(existing, existingUserTurn{
+				key: key, ts: msg.Timestamp,
+			})
+		}
+	}
+	matchers := []func(existing, want time.Time) bool{
+		func(existing, want time.Time) bool {
+			return !existing.IsZero() && !want.IsZero() && existing.Equal(want)
+		},
+		func(existing, want time.Time) bool {
+			return !existing.IsZero() && !want.IsZero() &&
+				existing.Unix() == want.Unix()
+		},
+		func(time.Time, time.Time) bool { return true },
+	}
+	keys := make([]string, len(history))
+	matched := make([]bool, len(history))
+	for hIdx, msg := range history {
+		keys[hIdx] = normalizedAntigravityPrompt(msg.Content)
+		matched[hIdx] = keys[hIdx] == ""
+	}
+	for _, sameTurn := range matchers {
+		for hIdx, msg := range history {
+			if matched[hIdx] {
+				continue
+			}
+			for i := range existing {
+				if !existing[i].used && existing[i].key == keys[hIdx] &&
+					sameTurn(existing[i].ts, msg.Timestamp) {
+					existing[i].used = true
+					matched[hIdx] = true
+					break
+				}
+			}
 		}
 	}
 	out := dbMessages
-	for _, msg := range history {
-		key := normalizedAntigravityPrompt(msg.Content)
-		if key == "" {
-			continue
+	for hIdx, msg := range history {
+		if !matched[hIdx] {
+			out = append(out, msg)
 		}
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		out = append(out, msg)
-		seen[key] = struct{}{}
 	}
 	return out
 }

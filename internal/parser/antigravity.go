@@ -641,10 +641,13 @@ func generationPlannerStep(
 		if !ok {
 			continue
 		}
-		if fallbackPos < 0 {
+		step := steps[position]
+		// An undecoded step of unknown kind may be the planner; carrying
+		// the usage there lets a brain transcript claim it by step index.
+		// A decoded non-planner step is never the generation's output.
+		if fallbackPos < 0 && !step.decoded {
 			fallbackPos = position
 		}
-		step := steps[position]
 		if step.kind == antigravityStepKindPlannerResponse {
 			if step.decoded {
 				return position, true
