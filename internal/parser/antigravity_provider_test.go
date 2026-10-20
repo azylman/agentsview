@@ -1358,13 +1358,13 @@ func TestAntigravityCLIBrainTranscriptAndFailClosed(t *testing.T) {
 				require.NoError(t, err)
 				mustExec(t, db, `CREATE TABLE gen_metadata (idx integer, data blob, size integer, PRIMARY KEY (idx))`)
 				genData := createAntigravityMockGenMetadata(t, 2400, 180, 0, "Test Gemini 3.5")
-				mustExec(t, db, `INSERT INTO gen_metadata (idx, data, size) VALUES (1, ?, ?)`, genData, len(genData))
+				mustExec(t, db, `INSERT INTO gen_metadata (idx, data, size) VALUES (2, ?, ?)`, genData, len(genData))
 				require.NoError(t, db.Close())
 				tp := antigravityBrainTranscriptPath(root, id)
 				mustMkdir(t, filepath.Dir(tp))
 				mustWrite(t, tp, []byte(
-					`{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"2026-10-19T10:00:00Z","content":"Check deployment"}`+"\n"+
-						`{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"2026-10-19T10:00:05Z","content":"Healthy.","thinking":"Checking","tool_calls":[{"id":"c1","name":"list_jobs","args":{}}]}`+"\n",
+					`{"step_index":1,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"2026-10-19T10:00:00Z","content":"Check deployment"}`+"\n"+
+						`{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"2026-10-19T10:00:05Z","content":"Healthy.","thinking":"Checking","tool_calls":[{"id":"c1","name":"list_jobs","args":{}}]}`+"\n",
 				))
 			}
 			provider, _ := NewProvider(AgentAntigravityCLI, ProviderConfig{Roots: []string{root}, Machine: "devbox"})
