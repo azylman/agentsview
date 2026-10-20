@@ -12,6 +12,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -483,8 +484,10 @@ func mergeAntigravityCLIBrainTranscript(
 	sidecarRes agyTrajectoryParseResult,
 	historyMsgs []ParsedMessage,
 ) ([]ParsedMessage, bool) {
-	dbByIdx := make(map[int]ParsedMessage, len(dbResult.steps))
-	for _, dbStep := range dbResult.steps {
+	history := nonEmptyAntigravityHistoryMessages(historyMsgs)
+	dbSteps := reconcileAntigravityDBStepsWithHistory(dbResult.steps, history)
+	dbByIdx := make(map[int]ParsedMessage, len(dbSteps))
+	for _, dbStep := range dbSteps {
 		dbByIdx[dbStep.idx] = dbStep.msg
 	}
 	sidecarMsgsByIdx := make(map[int][]ParsedMessage)
@@ -544,11 +547,48 @@ func mergeAntigravityCLIBrainTranscript(
 				msg.HasOutputTokens = true
 			}
 		}
+		if sMsgs, ok := sidecarMsgsByIdx[step.stepIndex]; ok && msg.Role == RoleAssistant {
+			for _, sMsg := range sMsgs {
+				if sMsg.Role != RoleAssistant {
+					continue
+				}
+				msg.ToolCalls = mergeAntigravityPlannerToolCalls(
+					msg.ToolCalls, sMsg.ToolCalls,
+				)
+				msg.HasToolUse = len(msg.ToolCalls) > 0
+				if msg.Content == "" && sMsg.Content != "" {
+					msg.Content = sMsg.Content
+					msg.ContentLength = sMsg.ContentLength
+				}
+				if !msg.HasThinking && sMsg.HasThinking {
+					msg.ThinkingText = sMsg.ThinkingText
+					msg.HasThinking = true
+				}
+				if msg.Model == "" && sMsg.Model != "" {
+					msg.Model = sMsg.Model
+				}
+				if !msg.HasContextTokens && sMsg.HasContextTokens {
+					msg.ContextTokens = sMsg.ContextTokens
+					msg.HasContextTokens = true
+				}
+				if !msg.HasOutputTokens && sMsg.HasOutputTokens {
+					msg.OutputTokens = sMsg.OutputTokens
+					msg.HasOutputTokens = true
+				}
+			}
+		}
 		brainDisplayableRoleByIdx[step.stepIndex] = msg.Role
 		if step.stepIndex > maxBrainDisplayableIdx {
 			maxBrainDisplayableIdx = step.stepIndex
 		}
 		merged = append(merged, msg)
+		if sMsgs, ok := sidecarMsgsByIdx[step.stepIndex]; ok {
+			for _, sMsg := range sMsgs {
+				if len(sMsg.ToolResults) > 0 {
+					merged = append(merged, sMsg)
+				}
+			}
+		}
 	}
 	for sIdx, sMsgs := range sidecarMsgsByIdx {
 		if _, exists := brainTimestampByIdx[sIdx]; !exists &&
@@ -564,10 +604,9 @@ func mergeAntigravityCLIBrainTranscript(
 			dbResult.usageEvents[i].OccurredAt = ts.Format(time.RFC3339Nano)
 		}
 	}
-	history := nonEmptyAntigravityHistoryMessages(historyMsgs)
 	covers := len(merged) > 0 && brainUserCount >= len(history)
 	sidecarUsedIdx := make(map[int]bool, len(sidecarMsgsByIdx))
-	for _, dbStep := range dbResult.steps {
+	for _, dbStep := range dbSteps {
 		if !isAntigravityBrainStepCovered(
 			dbStep, brainDisplayableRoleByIdx, maxBrainDisplayableIdx,
 		) {
@@ -592,6 +631,130 @@ func mergeAntigravityCLIBrainTranscript(
 	}
 	merged = appendMissingAntigravityHistoryMessages(merged, history)
 	return merged, covers
+}
+
+func mergeAntigravityPlannerToolCalls(
+	brainCalls, sidecarCalls []ParsedToolCall,
+) []ParsedToolCall {
+	if len(sidecarCalls) == 0 {
+		return brainCalls
+	}
+	if len(brainCalls) == 0 {
+		return slices.Clone(sidecarCalls)
+	}
+	out := slices.Clone(brainCalls)
+	matchedBrain := make([]bool, len(out))
+	for sIdx, sc := range sidecarCalls {
+		bIdx := -1
+		if sIdx < len(out) && !matchedBrain[sIdx] &&
+			(out[sIdx].ToolName == sc.ToolName || out[sIdx].ToolName == "") {
+			bIdx = sIdx
+		} else {
+			for i := range out {
+				if !matchedBrain[i] && out[i].ToolName == sc.ToolName {
+					bIdx = i
+					break
+				}
+			}
+		}
+		if bIdx >= 0 {
+			matchedBrain[bIdx] = true
+			if sc.ToolUseID != "" {
+				out[bIdx].ToolUseID = sc.ToolUseID
+			}
+			if out[bIdx].ToolName == "" {
+				out[bIdx].ToolName = sc.ToolName
+			}
+			if out[bIdx].Category == "" {
+				out[bIdx].Category = sc.Category
+			}
+			if out[bIdx].InputJSON == "" {
+				out[bIdx].InputJSON = sc.InputJSON
+			}
+			if out[bIdx].Rendering == "" {
+				out[bIdx].Rendering = sc.Rendering
+			}
+		} else {
+			out = append(out, sc)
+		}
+	}
+	return out
+}
+
+func reconcileAntigravityDBStepsWithHistory(
+	steps []antigravityLoadedStep, history []ParsedMessage,
+) []antigravityLoadedStep {
+	if len(steps) == 0 || len(history) == 0 {
+		return steps
+	}
+	out := slices.Clone(steps)
+	var userStepPositions []int
+	for i := range out {
+		if out[i].kind == antigravityStepKindUserInput ||
+			(out[i].decoded && isAntigravityUserPromptMessage(out[i].msg)) {
+			userStepPositions = append(userStepPositions, i)
+		}
+	}
+	if len(userStepPositions) == len(history) {
+		for hIdx, pos := range userStepPositions {
+			if !out[pos].decoded {
+				continue
+			}
+			out[pos].msg.Content = history[hIdx].Content
+			out[pos].msg.ContentLength = len(history[hIdx].Content)
+			if !history[hIdx].Timestamp.IsZero() {
+				out[pos].msg.Timestamp = history[hIdx].Timestamp
+			}
+		}
+		return out
+	}
+	matchedHistory := make([]bool, len(history))
+	for _, pos := range userStepPositions {
+		if !out[pos].decoded || out[pos].msg.Timestamp.IsZero() {
+			continue
+		}
+		wantMilli := out[pos].msg.Timestamp.UnixMilli()
+		for hIdx, hMsg := range history {
+			if !matchedHistory[hIdx] && !hMsg.Timestamp.IsZero() &&
+				hMsg.Timestamp.UnixMilli() == wantMilli {
+				matchedHistory[hIdx] = true
+				out[pos].msg.Content = hMsg.Content
+				out[pos].msg.ContentLength = len(hMsg.Content)
+				out[pos].msg.Timestamp = hMsg.Timestamp
+				break
+			}
+		}
+	}
+	for _, pos := range userStepPositions {
+		if !out[pos].decoded || out[pos].msg.Timestamp.IsZero() ||
+			out[pos].msg.Timestamp.Nanosecond() != 0 {
+			continue
+		}
+		wantSec := out[pos].msg.Timestamp.Unix()
+		matchIdx := -1
+		for hIdx, hMsg := range history {
+			if matchedHistory[hIdx] || hMsg.Timestamp.IsZero() ||
+				hMsg.Timestamp.Unix() != wantSec {
+				continue
+			}
+			if matchIdx >= 0 {
+				matchIdx = -1
+				break
+			}
+			matchIdx = hIdx
+		}
+		if matchIdx >= 0 {
+			matchedHistory[matchIdx] = true
+			out[pos].msg.Content = history[matchIdx].Content
+			out[pos].msg.ContentLength = len(history[matchIdx].Content)
+			out[pos].msg.Timestamp = history[matchIdx].Timestamp
+		}
+	}
+	return out
+}
+
+func isAntigravityUserPromptMessage(msg ParsedMessage) bool {
+	return msg.Role == RoleUser && !msg.IsSystem && len(msg.ToolResults) == 0
 }
 
 func isAntigravityBrainStepCovered(
@@ -643,7 +806,7 @@ func mergeAntigravityDBHistoryMessages(
 	}
 	userCount := 0
 	for _, msg := range dbMessages {
-		if msg.Role == RoleUser {
+		if isAntigravityUserPromptMessage(msg) {
 			userCount++
 		}
 	}
@@ -654,7 +817,7 @@ func mergeAntigravityDBHistoryMessages(
 	}
 	historyIdx := 0
 	for i := range dbMessages {
-		if dbMessages[i].Role != RoleUser {
+		if !isAntigravityUserPromptMessage(dbMessages[i]) {
 			continue
 		}
 		if historyIdx >= len(history) {
@@ -676,18 +839,20 @@ func appendMissingAntigravityHistoryMessages(
 	dbMessages []ParsedMessage, history []ParsedMessage,
 ) []ParsedMessage {
 	type existingUserTurn struct {
+		msgIdx    int
 		key       string
 		unixMilli int64
 		hasTS     bool
 		used      bool
 	}
 	var existing []existingUserTurn
-	for _, msg := range dbMessages {
-		if msg.Role != RoleUser {
+	for idx, msg := range dbMessages {
+		if !isAntigravityUserPromptMessage(msg) {
 			continue
 		}
 		if key := normalizedAntigravityPrompt(msg.Content); key != "" {
 			existing = append(existing, existingUserTurn{
+				msgIdx:    idx,
 				key:       key,
 				unixMilli: msg.Timestamp.UnixMilli(),
 				hasTS:     !msg.Timestamp.IsZero(),
@@ -712,6 +877,24 @@ func appendMissingAntigravityHistoryMessages(
 				matched[hIdx] = true
 				break
 			}
+		}
+	}
+	for hIdx, msg := range history {
+		if matched[hIdx] || msg.Timestamp.IsZero() {
+			continue
+		}
+		wantMilli := msg.Timestamp.UnixMilli()
+		for i := range existing {
+			if existing[i].used || !existing[i].hasTS ||
+				existing[i].unixMilli != wantMilli {
+				continue
+			}
+			existing[i].used = true
+			matched[hIdx] = true
+			dbMessages[existing[i].msgIdx].Content = msg.Content
+			dbMessages[existing[i].msgIdx].ContentLength = len(msg.Content)
+			dbMessages[existing[i].msgIdx].Timestamp = msg.Timestamp
+			break
 		}
 	}
 	out := dbMessages

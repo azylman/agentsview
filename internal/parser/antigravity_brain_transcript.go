@@ -213,6 +213,7 @@ func antigravityBrainToolCalls(calls gjson.Result) []ParsedToolCall {
 			continue
 		}
 		out = append(out, ParsedToolCall{
+			ToolUseID: call.Get("id").Str,
 			ToolName:  name,
 			Category:  NormalizeToolCategory(name),
 			InputJSON: call.Get("args").Raw,
