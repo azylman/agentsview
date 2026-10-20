@@ -3935,13 +3935,15 @@ schemas keep their existing ordering behavior.
   `internal/parser/antigravity_cli_provider.go`. Plaintext brain transcripts
   at `brain/<uuid>/.system_generated/logs/transcript.jsonl` are folded into
   CLI sessions alongside `.db` `gen_metadata` token usage. A brain transcript
-  replaces the SQLite decode only when its `step_index` values reach the last
-  SQLite step and every decoded, user, or planner step has an entry at the
-  same index; otherwise it is a fallback, and `history.jsonl` prompts it lacks
-  are added back. Checkpointed WAL databases on read-only mounts without
+  replaces the SQLite decode only when every SQLite step has a transcript line
+  at the same `step_index`, and every decoded, user, or planner step's line
+  has content; otherwise it is a fallback, and `history.jsonl` prompts it
+  lacks are added back. Generation metadata moves only onto the model's own
+  transcript entries. Checkpointed WAL databases on read-only mounts without
   `.db-shm` or framed `-wal` sidecars fall back to `immutable=1`. An
-  unreadable database with no fallback transcript or usage fails the parse.
-  The CLI `history.jsonl` `workspace` value and the current CLI's
+  unreadable database fails the parse unless a trajectory sidecar supplies the
+  transcript or only `history.jsonl` remains, which is stored for retry. The
+  CLI `history.jsonl` `workspace` value and the current CLI's
   `cache/last_conversations.json` workspace-to-conversation mapping are
   authoritative session CWD sources when the workspace is an absolute path.
   Agentsview prefers the first valid current-cache folder for an exact

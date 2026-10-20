@@ -203,7 +203,7 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 			messages = tRes.messages
 			hasTrajectory = true
 			status.NeedsRetry = true
-		case brainTranscriptOK:
+		case dbErr == nil && brainTranscriptOK:
 			// A partial brain log can miss user turns that history.jsonl
 			// recorded, so fold those back in.
 			messages = appendMissingAntigravityHistoryMessages(
@@ -281,10 +281,13 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 		}
 	}
 
-	if ext == ".db" && dbErr != nil && len(messages) == 0 && len(usageEvents) == 0 {
+	if ext == ".db" && dbErr != nil && !hasTrajectory &&
+		(brainTranscriptOK || (len(messages) == 0 && len(usageEvents) == 0)) {
 		// Fail closed when the SQLite database could not be read and no
-		// fallback source supplied messages or usage events, so sync does
-		// not clobber a previously stored transcript with an empty session.
+		// trajectory sidecar supplied the transcript. This provider
+		// force-replaces stored messages, so a partial brain transcript or
+		// an empty session would delete archived replies. The parse error
+		// keeps the stored session, and sync retries failed files.
 		return nil, nil, nil, status, dbErr
 	}
 
@@ -480,31 +483,30 @@ func loadAntigravityCLIDBStepsWithOptions(
 }
 
 // antigravityBrainTranscriptCoversDB reports whether the brain transcript
-// holds every SQLite step that has content. The log skips steps that logged
-// nothing, so it must reach the last step, and every decoded step and every
-// user or planner step must have a displayable entry at the same index.
+// accounts for every SQLite step. Each step needs a transcript line at the
+// same index. A decoded step and any user or planner step need a
+// displayable line; for other undecodable steps, an empty line shows the
+// step logged nothing. A missing line proves nothing, so it fails coverage.
 func antigravityBrainTranscriptCoversDB(
 	brainSteps []antigravityBrainTranscriptStep,
 	dbSteps []antigravityLoadedStep,
 ) bool {
-	maxBrainIdx := -1
 	displayable := make(map[int]bool, len(brainSteps))
 	for _, bs := range brainSteps {
-		maxBrainIdx = max(maxBrainIdx, bs.stepIndex)
-		if hasDisplayableAntigravityCLITrajectoryMessage(
-			[]ParsedMessage{bs.msg},
-		) {
-			displayable[bs.stepIndex] = true
-		}
+		displayable[bs.stepIndex] = displayable[bs.stepIndex] ||
+			hasDisplayableAntigravityCLITrajectoryMessage(
+				[]ParsedMessage{bs.msg},
+			)
 	}
 	for _, step := range dbSteps {
-		if step.idx > maxBrainIdx {
+		hasContent, logged := displayable[step.idx]
+		if !logged {
 			return false
 		}
-		needsEntry := step.decoded ||
+		needsContent := step.decoded ||
 			step.kind == antigravityStepKindUserInput ||
 			step.kind == antigravityStepKindPlannerResponse
-		if needsEntry && !displayable[step.idx] {
+		if needsContent && !hasContent {
 			return false
 		}
 	}
@@ -515,17 +517,24 @@ func applyAntigravityBrainStepMetadata(
 	brainSteps []antigravityBrainTranscriptStep,
 	dbResult antigravityStepLoadResult,
 ) ([]ParsedMessage, []ParsedUsageEvent) {
-	dbStepByIdx := make(map[int]ParsedMessage, len(dbResult.steps))
-	for _, s := range dbResult.steps {
+	dbStepByIdx := make(map[int]ParsedMessage,
+		len(dbResult.steps)+len(dbResult.metadataSteps))
+	for _, s := range slices.Concat(dbResult.steps, dbResult.metadataSteps) {
 		dbStepByIdx[s.idx] = s.msg
 	}
+	// Generation metadata describes model output, so only the model's own
+	// entries take its model, tokens, and timestamp.
 	brainTimeByIdx := make(map[int]time.Time, len(brainSteps))
 	msgs := make([]ParsedMessage, len(brainSteps))
 	for i, bs := range brainSteps {
-		if !bs.msg.Timestamp.IsZero() {
-			brainTimeByIdx[bs.stepIndex] = bs.msg.Timestamp
-		}
 		msg := bs.msg
+		msgs[i] = msg
+		if msg.Role != RoleAssistant {
+			continue
+		}
+		if !msg.Timestamp.IsZero() {
+			brainTimeByIdx[bs.stepIndex] = msg.Timestamp
+		}
 		if dbMsg, ok := dbStepByIdx[bs.stepIndex]; ok {
 			if msg.Model == "" && dbMsg.Model != "" {
 				msg.Model = dbMsg.Model

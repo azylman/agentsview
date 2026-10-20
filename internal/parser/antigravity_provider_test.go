@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1465,6 +1466,16 @@ func TestAntigravityCLIBrainTranscriptSourceSelection(t *testing.T) {
 		mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (1, 17, ?)`,
 			antigravityTestStepPayload(1779000100, "assistant reply content body"))
 	}
+	decodedStepsAroundUndecodableTool := func(t *testing.T, db *sql.DB) {
+		mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (0, 14, ?)`,
+			antigravityTestStepPayload(1779000000, "user prompt text goes here"))
+		mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (1, 21, X'00')`)
+		mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (2, 17, ?)`,
+			antigravityTestStepPayload(1779000100, "assistant reply content body"))
+	}
+	replyLine := func(idx int) string {
+		return `{"step_index":` + strconv.Itoa(idx) + `,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"2026-05-17T06:41:40Z","content":"assistant reply content body"}` + "\n"
+	}
 	userLine := `{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"2026-05-17T06:40:00Z","content":"Check deployment"}` + "\n"
 	assistantLine := `{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"2026-05-17T06:41:40Z","content":"Healthy."}` + "\n"
 	history := `{"conversationId":"` + id + `","timestamp":1779000000000,"display":"Check deployment"}` + "\n"
@@ -1483,14 +1494,8 @@ func TestAntigravityCLIBrainTranscriptSourceSelection(t *testing.T) {
 			wantContents: []string{"Check deployment", "sidecar reply body"},
 		},
 		{
-			name:           "unreadable db falls back to brain transcript and retries",
-			fixture:        antigravityCLIBrainFixture{transcript: assistantLine, history: history},
-			wantNeedsRetry: true,
-			wantContents:   []string{"Check deployment", "Healthy."},
-		},
-		{
-			name:    "unreadable db without any fallback fails closed",
-			fixture: antigravityCLIBrainFixture{},
+			name:    "unreadable db with a brain transcript fails closed",
+			fixture: antigravityCLIBrainFixture{transcript: userLine + assistantLine, history: history},
 			wantErr: true,
 		},
 		{
@@ -1510,6 +1515,24 @@ func TestAntigravityCLIBrainTranscriptSourceSelection(t *testing.T) {
 					`{"step_index":2,"source":"SYSTEM","type":"CONVERSATION_HISTORY","created_at":"2026-05-17T06:40:02Z"}` + "\n",
 			},
 			wantContents: []string{"user prompt text goes here", "assistant reply content body"},
+		},
+		{
+			name: "undecodable middle step missing from brain transcript keeps db decode",
+			fixture: antigravityCLIBrainFixture{
+				setupDB:    decodedStepsAroundUndecodableTool,
+				transcript: userLine + replyLine(2),
+			},
+			wantContents: []string{"user prompt text goes here", "assistant reply content body"},
+		},
+		{
+			name: "empty brain line covers an undecodable middle step",
+			fixture: antigravityCLIBrainFixture{
+				setupDB: decodedStepsAroundUndecodableTool,
+				transcript: userLine +
+					`{"step_index":1,"source":"SYSTEM","type":"RUN_COMMAND","created_at":"2026-05-17T06:40:10Z"}` + "\n" +
+					replyLine(2),
+			},
+			wantContents: []string{"Check deployment", "", "assistant reply content body"},
 		},
 		{
 			name: "system brain step covers a decoded db step of another role",
@@ -1590,4 +1613,74 @@ func TestAntigravityGenMetadataDoesNotAttachToNonPlannerStep(t *testing.T) {
 	assert.False(t, msgs[0].HasOutputTokens)
 	require.Len(t, usageEvents, 1)
 	assert.Equal(t, 2400, usageEvents[0].InputTokens)
+}
+
+// Generation metadata reaches a brain transcript only through the model's
+// own entry. A generation that lists an undecodable user row moves to the
+// missing output step; one whose last step is a known non-planner step stays
+// an event.
+func TestAntigravityBrainTranscriptGenMetadataTargetsModelEntry(t *testing.T) {
+	const id = "99999999-aaaa-bbbb-cccc-dddddddddddd"
+	transcript := `{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"2026-05-17T06:40:00Z","content":"Check deployment"}` + "\n" +
+		`{"step_index":1,"source":"MODEL","type":"RUN_COMMAND","created_at":"2026-05-17T06:40:20Z","content":"ran the deployment check"}` + "\n"
+	tests := []struct {
+		name         string
+		steps        func(t *testing.T, db *sql.DB)
+		wantModelIdx int
+		wantOccurred string
+	}{
+		{
+			name: "undecodable user row hands usage to the missing output step",
+			steps: func(t *testing.T, db *sql.DB) {
+				mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (0, 14, X'00')`)
+			},
+			wantModelIdx: 1,
+			wantOccurred: "2026-05-17T06:40:20Z",
+		},
+		{
+			name: "known non-planner last step keeps usage as an event",
+			steps: func(t *testing.T, db *sql.DB) {
+				mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (0, 14, ?)`,
+					antigravityTestStepPayload(1779000000, "user prompt text goes here"))
+				mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (1, 21, ?)`,
+					antigravityTestStepPayload(1779000020, "ran the deployment check command"))
+			},
+			wantModelIdx: -1,
+			wantOccurred: "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := antigravityCLIBrainFixture{
+				setupDB: func(t *testing.T, db *sql.DB) {
+					tc.steps(t, db)
+					mustExec(t, db, `CREATE TABLE gen_metadata (idx integer, data blob, size integer, PRIMARY KEY (idx))`)
+					genData := createAntigravityMockGenMetadataForSteps(
+						t, 2400, 180, 0, "Test Gemini 3.5", agChatModelMetadataModelDisplayNameField, 0, 1,
+					)
+					mustExec(t, db, `INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?, ?)`, genData, len(genData))
+				},
+				transcript: transcript,
+			}.write(t, id)
+
+			_, msgs, usageEvents, _, err := parseAntigravityCLITestSessionWithStatus(
+				t, path, "", "devbox",
+			)
+			require.NoError(t, err)
+			require.Len(t, msgs, 2)
+			assert.Equal(t, "Check deployment", msgs[0].Content, "brain transcript is selected")
+			for i, m := range msgs {
+				if i == tc.wantModelIdx {
+					assert.Equal(t, "Test Gemini 3.5", m.Model)
+					assert.Equal(t, 180, m.OutputTokens)
+					continue
+				}
+				assert.Empty(t, m.Model, "message %d", i)
+				assert.False(t, m.HasOutputTokens, "message %d", i)
+			}
+			require.Len(t, usageEvents, 1)
+			assert.Equal(t, 2400, usageEvents[0].InputTokens)
+			assert.Equal(t, tc.wantOccurred, usageEvents[0].OccurredAt)
+		})
+	}
 }

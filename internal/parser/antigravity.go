@@ -271,8 +271,12 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
 }
 
 type antigravityStepLoadResult struct {
-	messages              []ParsedMessage
-	steps                 []antigravityLoadedStep
+	messages []ParsedMessage
+	steps    []antigravityLoadedStep
+	// metadataSteps carry gen_metadata usage for output steps the steps
+	// table has not written yet, so a brain transcript entry at that index
+	// can still claim the generation's model and tokens.
+	metadataSteps         []antigravityLoadedStep
 	usageEvents           []ParsedUsageEvent
 	usageEventStepIndices []int
 	// executors is retained for preferred trajectory sidecars so their
@@ -430,17 +434,21 @@ func loadAntigravityStepsWithRawCount(ctx context.Context,
 			executorModel = executorModelForStep(executors, maxStepIdx)
 		}
 		if !found {
+			// The usage is recorded as an event only. When the
+			// generation's last step has no row yet, it is most likely the
+			// missing output, so a carrier at that index keeps the model
+			// and tokens for the brain transcript. A last step that exists
+			// but is not the planner gets nothing.
 			stepIdx := -1
-			if known {
+			if _, exists := stepPositions[maxStepIdx]; known && !exists {
 				stepIdx = maxStepIdx
 			}
 			genMsg := result.appendGenMetadataUsage(
 				stepIdx, generation.data, ParsedMessage{}, false, executorModel,
 			)
 			if stepIdx >= 0 {
-				steps = append(steps, antigravityLoadedStep{
-					idx: stepIdx, msg: genMsg,
-				})
+				result.metadataSteps = append(result.metadataSteps,
+					antigravityLoadedStep{idx: stepIdx, msg: genMsg})
 			}
 			continue
 		}
@@ -644,8 +652,10 @@ func generationPlannerStep(
 		step := steps[position]
 		// An undecoded step of unknown kind may be the planner; carrying
 		// the usage there lets a brain transcript claim it by step index.
-		// A decoded non-planner step is never the generation's output.
-		if fallbackPos < 0 && !step.decoded {
+		// Decoded non-planner steps and user steps are never the
+		// generation's output.
+		if fallbackPos < 0 && !step.decoded &&
+			step.kind != antigravityStepKindUserInput {
 			fallbackPos = position
 		}
 		if step.kind == antigravityStepKindPlannerResponse {
