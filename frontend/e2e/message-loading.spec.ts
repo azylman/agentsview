@@ -13,6 +13,25 @@ type FollowRafWindow = Window & {
 };
 
 test.describe("Message loading", () => {
+  test.beforeEach(async ({ page }) => {
+    await page.addInitScript(() => {
+      localStorage.setItem("agentsview-sort-newest-first", "false");
+    });
+  });
+
+  test("defaults to newest-first sort order when no preference is stored", async ({ page }) => {
+    await page.addInitScript(() => {
+      localStorage.removeItem("agentsview-sort-newest-first");
+    });
+    const sp = new SessionsPage(page);
+    await page.goto("/sessions/test-session-mixed-content-7");
+    await expect(sp.messageRows.first()).toBeVisible({ timeout: 5_000 });
+    await expect(page.locator(".thinking-block").first()).toContainText("Gemini-style reasoning");
+    expect(await page.evaluate(() => localStorage.getItem("agentsview-sort-newest-first"))).toBe(
+      "true",
+    );
+  });
+
   test("clicking session shows messages", async ({ page }) => {
     const sp = new SessionsPage(page);
     await sp.goto();

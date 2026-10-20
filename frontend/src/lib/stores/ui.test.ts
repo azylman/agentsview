@@ -695,6 +695,37 @@ describe("UIStore", () => {
       ui.toggleSort();
       expect(ui.sortNewestFirst).toBe(!initial);
     });
+
+    it("defaults sortNewestFirst to true, restores stored false, and persists toggle", async () => {
+      const original = globalThis.localStorage;
+      const stored = new Map<string, string>();
+      const setItem = vi.fn((k: string, v: string) => stored.set(k, v));
+      Object.defineProperty(globalThis, "localStorage", {
+        value: { getItem: vi.fn((k: string) => stored.get(k) ?? null), setItem },
+        writable: true,
+        configurable: true,
+      });
+      try {
+        // @ts-expect-error -- query string busts module cache
+        const fresh = await import("./ui.svelte.js?sortNewestFirstDefault");
+        expect(fresh.ui.sortNewestFirst).toBe(true);
+        setItem.mockClear();
+        fresh.ui.toggleSort();
+        await tick();
+        expect(fresh.ui.sortNewestFirst).toBe(false);
+        expect(setItem).toHaveBeenCalledWith("agentsview-sort-newest-first", "false");
+
+        // @ts-expect-error -- query string busts module cache
+        const restored = await import("./ui.svelte.js?sortNewestFirstStoredFalse");
+        expect(restored.ui.sortNewestFirst).toBe(false);
+      } finally {
+        Object.defineProperty(globalThis, "localStorage", {
+          value: original,
+          writable: true,
+          configurable: true,
+        });
+      }
+    });
   });
 
   describe("block type filtering", () => {

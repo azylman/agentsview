@@ -19,6 +19,9 @@ const TOOL_VIEWPORTS = [1280, 768] as const;
 const TOOL_THEMES = ["light", "dark"] as const;
 
 async function selectSession(page: Page): Promise<string> {
+  await page.addInitScript(() => {
+    localStorage.setItem("agentsview-sort-newest-first", "false");
+  });
   await page.goto(`/sessions/${MIXED_CONTENT_SESSION_ID}`);
   return MIXED_CONTENT_SESSION_ID;
 }

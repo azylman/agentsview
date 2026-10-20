@@ -16,6 +16,7 @@ async function gotoShowcase(page: Page) {
   // so the panel renders on first paint.
   await page.addInitScript(() => {
     localStorage.setItem("agentsview-session-vitals", "true");
+    localStorage.setItem("agentsview-sort-newest-first", "false");
   });
   // The panel and its first call are the readiness contract below. Waiting
   // for WebKit's full load event also waits on unrelated page resources and

@@ -5,6 +5,9 @@ test.describe("Navigation", () => {
   let sp: SessionsPage;
 
   test.beforeEach(async ({ page }) => {
+    await page.addInitScript(() => {
+      localStorage.setItem("agentsview-sort-newest-first", "false");
+    });
     sp = new SessionsPage(page);
     await sp.goto();
   });

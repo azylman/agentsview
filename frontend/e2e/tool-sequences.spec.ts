@@ -16,6 +16,7 @@ test("renders, expands, and navigates observed sequences at desktop, tablet, and
 }, testInfo) => {
   await page.addInitScript(() => {
     localStorage.setItem("agentsview-signal-panel", "true");
+    localStorage.setItem("agentsview-sort-newest-first", "false");
   });
 
   for (const width of [1280, 768, 400]) {
@@ -104,6 +105,7 @@ test("renders, expands, and navigates observed sequences at desktop, tablet, and
 test("opens a sequence link in a fresh page and refuses one whose call moved", async ({ page }) => {
   await page.addInitScript(() => {
     localStorage.setItem("agentsview-signal-panel", "true");
+    localStorage.setItem("agentsview-sort-newest-first", "false");
   });
   const panel = await openSession(page, 1280);
   await panel.locator(".sequence-row").first().click();
@@ -131,6 +133,7 @@ test("opens a sequence link in a fresh page and refuses one whose call moved", a
 test("shows the empty state for a session with no messages", async ({ page }) => {
   await page.addInitScript(() => {
     localStorage.setItem("agentsview-signal-panel", "true");
+    localStorage.setItem("agentsview-sort-newest-first", "false");
   });
 
   await page.setViewportSize({ width: 768, height: 900 });
