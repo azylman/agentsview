@@ -89,6 +89,7 @@ async function installFixture(page: Page, options: FixtureOptions = {}) {
       localStorage.setItem("agentsview-block-filters", filters);
       localStorage.setItem("agentsview-transcript-mode", mode);
       localStorage.setItem("agentsview-message-layout", "skim");
+      localStorage.setItem("agentsview-sort-newest-first", "false");
     },
     { filters: JSON.stringify({ hidden }), mode },
   );

@@ -187,6 +187,9 @@ test("saved tool-effectiveness report keeps conclusions, sequences, and omission
 });
 
 test("cited calls and sequence calls open the transcript at the cited call", async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("agentsview-sort-newest-first", "false");
+  });
   const session = await (await page.request.get(`/api/v1/sessions/${SESSION_ID}`)).json();
   const seeded = seededReport(session.transcript_revision);
   await serveReports(page, [seeded]);
@@ -228,6 +231,9 @@ test("cited calls and sequence calls open the transcript at the cited call", asy
 });
 
 test("a link whose call no longer matches its fingerprint selects nothing", async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("agentsview-sort-newest-first", "false");
+  });
   const selected = page.locator(".message-list-scroll .virtual-row.selected");
   // The matching fingerprint opens the call, so the refusal below comes from the check.
   await page.goto(`/sessions/${SESSION_ID}?msg=3&call=0&tool_use_id=read-1&fp=7111f37f`, {

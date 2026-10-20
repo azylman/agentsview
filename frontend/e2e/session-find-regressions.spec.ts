@@ -35,6 +35,7 @@ async function installMessages(
     ({ filters }) => {
       localStorage.setItem("agentsview-block-filters", filters);
       localStorage.setItem("agentsview-transcript-mode", "normal");
+      localStorage.setItem("agentsview-sort-newest-first", "false");
     },
     { filters: JSON.stringify({ hidden }) },
   );
