@@ -271,10 +271,8 @@ func (p *antigravityProvider) parseSession(ctx context.Context,
 }
 
 type antigravityStepLoadResult struct {
-	messages              []ParsedMessage
-	steps                 []antigravityLoadedStep
-	usageEvents           []ParsedUsageEvent
-	usageEventStepIndices []int
+	messages    []ParsedMessage
+	usageEvents []ParsedUsageEvent
 	// executors is retained for preferred trajectory sidecars so their
 	// generatorMetadata uses the same range-qualified model attribution as
 	// SQLite gen_metadata.
@@ -295,16 +293,8 @@ type antigravityStepLoadResult struct {
 type antigravityStepKind int
 
 const (
-	antigravityStepKindCodeAction      antigravityStepKind = 5
-	antigravityStepKindGrepSearch      antigravityStepKind = 7
-	antigravityStepKindViewFile        antigravityStepKind = 8
-	antigravityStepKindListDirectory   antigravityStepKind = 9
 	antigravityStepKindUserInput       antigravityStepKind = 14
 	antigravityStepKindPlannerResponse antigravityStepKind = 15
-	antigravityStepKindRunCommand      antigravityStepKind = 21
-	antigravityStepKindCheckpoint      antigravityStepKind = 23
-	antigravityStepKindSystemMessage   antigravityStepKind = 101
-	antigravityStepKindGeneric         antigravityStepKind = 132
 )
 
 // These field numbers come from the FileDescriptorProto records embedded in
@@ -420,7 +410,7 @@ func loadAntigravityStepsWithRawCount(ctx context.Context,
 		}
 		stepPositions[idx] = len(steps)
 		steps = append(steps, antigravityLoadedStep{
-			idx: idx, kind: kind, msg: msg, decoded: decoded,
+			kind: kind, msg: msg, decoded: decoded,
 		})
 		result.rawStepCount++
 	}
@@ -433,23 +423,18 @@ func loadAntigravityStepsWithRawCount(ctx context.Context,
 			generation, steps, stepPositions,
 		)
 		executorModel := ""
-		maxStepIdx, known := generation.maxStepIndex()
-		if known {
-			executorModel = executorModelForStep(executors, maxStepIdx)
+		if stepIndex, known := generation.maxStepIndex(); known {
+			executorModel = executorModelForStep(executors, stepIndex)
 		}
 		if !found {
-			stepIdx := -1
-			if known {
-				stepIdx = maxStepIdx
-			}
 			result.appendGenMetadataUsage(
-				stepIdx, generation.data, ParsedMessage{}, false, executorModel,
+				generation.data, ParsedMessage{}, false, executorModel,
 			)
 			continue
 		}
 		step := &steps[position]
 		step.msg = result.appendGenMetadataUsage(
-			step.idx, generation.data, step.msg, step.decoded, executorModel,
+			generation.data, step.msg, step.decoded, executorModel,
 		)
 	}
 	for _, step := range steps {
@@ -457,12 +442,10 @@ func loadAntigravityStepsWithRawCount(ctx context.Context,
 			result.messages = append(result.messages, step.msg)
 		}
 	}
-	result.steps = steps
 	return result, nil
 }
 
 type antigravityLoadedStep struct {
-	idx     int
 	kind    antigravityStepKind
 	msg     ParsedMessage
 	decoded bool
@@ -637,33 +620,18 @@ func generationPlannerStep(
 	steps []antigravityLoadedStep,
 	positions map[int]int,
 ) (int, bool) {
-	fallbackPos := -1
-	plannerPos := -1
 	for _, idx := range generation.stepIndices {
 		position, ok := positions[idx]
 		if !ok {
 			continue
 		}
-		if fallbackPos < 0 {
-			fallbackPos = position
-		}
 		step := steps[position]
-		if step.kind == antigravityStepKindPlannerResponse {
-			if step.decoded {
-				return position, true
-			}
-			if plannerPos < 0 {
-				plannerPos = position
-			}
+		if step.kind == antigravityStepKindPlannerResponse &&
+			step.decoded {
+			return position, true
 		}
 	}
 	if generation.hasStepIndices {
-		if plannerPos >= 0 {
-			return plannerPos, true
-		}
-		if fallbackPos >= 0 {
-			return fallbackPos, true
-		}
 		return 0, false
 	}
 	position, ok := positions[generation.idx]
@@ -682,13 +650,12 @@ func executorModelForStep(
 }
 
 // appendGenMetadataUsage records a usage event from one gen_metadata
-// payload and attaches token counts and the model name to the returned
-// message copy. Usage extraction is deliberately independent of message
-// decoding: a step the heuristic cannot render can still be rescued by
-// the CLI trajectory sidecar or brain transcript, and its usage must not
-// be dropped.
+// payload and, when the step decoded into a message, attaches token
+// counts and the model name to the returned copy. Usage extraction is
+// deliberately independent of message decoding: a step the heuristic
+// cannot render can still be rescued by the CLI trajectory sidecar
+// transcript, and its usage must not be dropped.
 func (r *antigravityStepLoadResult) appendGenMetadataUsage(
-	stepIdx int,
 	data []byte,
 	msg ParsedMessage,
 	decoded bool,
@@ -711,11 +678,12 @@ func (r *antigravityStepLoadResult) appendGenMetadataUsage(
 			if !msg.Timestamp.IsZero() {
 				occurredAt = msg.Timestamp.Format(time.RFC3339Nano)
 			}
+			msg.ContextTokens = context
+			msg.OutputTokens = block.TotalOutput
+			msg.HasContextTokens = context > 0
+			msg.HasOutputTokens = block.TotalOutput > 0
+
 		}
-		msg.ContextTokens = context
-		msg.OutputTokens = block.TotalOutput
-		msg.HasContextTokens = context > 0
-		msg.HasOutputTokens = block.TotalOutput > 0
 		r.usageEvents = append(r.usageEvents, ParsedUsageEvent{
 			Source:               "generation",
 			Model:                eventModel,
@@ -725,9 +693,8 @@ func (r *antigravityStepLoadResult) appendGenMetadataUsage(
 			ReasoningTokens:      0, // not available in gen_metadata
 			OccurredAt:           occurredAt,
 		})
-		r.usageEventStepIndices = append(r.usageEventStepIndices, stepIdx)
 	}
-	if genModel != "" {
+	if decoded && genModel != "" {
 		msg.Model = genModel
 	}
 	return msg
