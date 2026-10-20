@@ -1329,6 +1329,7 @@ func TestAntigravityProvidersReadOnlyCheckpointedWAL(t *testing.T) {
 			outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
 			require.NoError(t, err)
 			require.Len(t, outcome.Results, 1)
+			assert.Equal(t, DataVersionCurrent, outcome.Results[0].DataVersion)
 			assert.NotEmpty(t, outcome.Results[0].Result.Messages)
 		})
 	}
@@ -1362,8 +1363,8 @@ func TestAntigravityCLIBrainTranscriptAndFailClosed(t *testing.T) {
 				tp := antigravityBrainTranscriptPath(root, id)
 				mustMkdir(t, filepath.Dir(tp))
 				mustWrite(t, tp, []byte(
-					`{"step_index":1,"type":"USER_INPUT","created_at":"2026-10-19T10:00:00Z","content":"Check deployment"}`+"\n"+
-						`{"step_index":2,"type":"PLANNER_RESPONSE","created_at":"2026-10-19T10:00:05Z","content":"Healthy.","thinking":"Checking","tool_calls":[{"id":"c1","name":"list_jobs","args":{}}]}`+"\n",
+					`{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"2026-10-19T10:00:00Z","content":"Check deployment"}`+"\n"+
+						`{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"2026-10-19T10:00:05Z","content":"Healthy.","thinking":"Checking","tool_calls":[{"id":"c1","name":"list_jobs","args":{}}]}`+"\n",
 				))
 			}
 			provider, _ := NewProvider(AgentAntigravityCLI, ProviderConfig{Roots: []string{root}, Machine: "devbox"})
@@ -1380,8 +1381,12 @@ func TestAntigravityCLIBrainTranscriptAndFailClosed(t *testing.T) {
 			require.Len(t, res.Messages, 2)
 			assert.Equal(t, TranscriptFidelityFull, res.Session.TranscriptFidelity)
 			assert.True(t, res.Messages[1].HasThinking)
+			assert.Equal(t, "Test Gemini 3.5", res.Messages[1].Model)
+			assert.Equal(t, 2400, res.Messages[1].ContextTokens)
+			assert.Equal(t, 180, res.Messages[1].OutputTokens)
 			require.Len(t, res.UsageEvents, 1)
 			assert.Equal(t, 2400, res.UsageEvents[0].InputTokens)
+			assert.Equal(t, "2026-10-19T10:00:05Z", res.UsageEvents[0].OccurredAt)
 		})
 	}
 }

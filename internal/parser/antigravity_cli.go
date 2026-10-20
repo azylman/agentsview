@@ -121,11 +121,15 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 	// stays empty for legacy .pb and sidecar-only sessions where no schema
 	// is available, so SourceVersion is never fabricated.
 	var sourceVersion string
-	brainTranscriptMsgs, brainTranscriptErr := collectAntigravityBrainTranscriptMessages(
+	brainTranscriptSteps, brainTranscriptErr := collectAntigravityBrainTranscriptSteps(
 		antigravityBrainTranscriptPath(root, id),
 	)
 	if brainTranscriptErr != nil && !os.IsNotExist(brainTranscriptErr) {
 		return nil, nil, nil, status, brainTranscriptErr
+	}
+	brainTranscriptMsgs := make([]ParsedMessage, len(brainTranscriptSteps))
+	for i, s := range brainTranscriptSteps {
+		brainTranscriptMsgs[i] = s.msg
 	}
 	brainTranscriptOK := hasDisplayableAntigravityCLITrajectoryMessage(
 		brainTranscriptMsgs,
@@ -144,6 +148,11 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 		// (unreadable DB or missing gen_metadata table) so the same
 		// generation is never counted twice.
 		usageEvents = dbResult.usageEvents
+		if brainTranscriptOK && dbErr == nil {
+			brainTranscriptMsgs, usageEvents = applyAntigravityBrainStepMetadata(
+				brainTranscriptSteps, dbResult,
+			)
+		}
 		dbOK := dbErr == nil &&
 			hasDisplayableAntigravityCLITrajectoryMessage(dbResult.messages)
 
@@ -167,8 +176,8 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 			hasDisplayableAntigravityCLITrajectoryMessage(tRes.messages)
 		sidecarCovers := dbErr != nil || dbResult.rawStepCount == 0 ||
 			tRes.rawSteps >= dbResult.rawStepCount
-		brainTranscriptCovers := dbErr != nil || len(dbResult.messages) == 0 ||
-			len(brainTranscriptMsgs) >= len(dbResult.messages)
+		brainTranscriptCovers := dbErr == nil && (len(dbResult.messages) == 0 ||
+			len(brainTranscriptMsgs) >= len(dbResult.messages))
 		switch {
 		case sidecarOK && sidecarCovers:
 			messages = tRes.messages
@@ -461,6 +470,48 @@ func loadAntigravityCLIDBStepsWithOptions(
 		return result, err
 	}
 	return result, nil
+}
+
+func applyAntigravityBrainStepMetadata(
+	brainSteps []antigravityBrainTranscriptStep,
+	dbResult antigravityStepLoadResult,
+) ([]ParsedMessage, []ParsedUsageEvent) {
+	dbStepByIdx := make(map[int]ParsedMessage, len(dbResult.steps))
+	for _, s := range dbResult.steps {
+		dbStepByIdx[s.idx] = s.msg
+	}
+	brainTimeByIdx := make(map[int]time.Time, len(brainSteps))
+	msgs := make([]ParsedMessage, len(brainSteps))
+	for i, bs := range brainSteps {
+		if !bs.msg.Timestamp.IsZero() {
+			brainTimeByIdx[bs.stepIndex] = bs.msg.Timestamp
+		}
+		msg := bs.msg
+		if dbMsg, ok := dbStepByIdx[bs.stepIndex]; ok {
+			if msg.Model == "" && dbMsg.Model != "" {
+				msg.Model = dbMsg.Model
+			}
+			if !msg.HasContextTokens && dbMsg.HasContextTokens {
+				msg.ContextTokens = dbMsg.ContextTokens
+				msg.HasContextTokens = true
+			}
+			if !msg.HasOutputTokens && dbMsg.HasOutputTokens {
+				msg.OutputTokens = dbMsg.OutputTokens
+				msg.HasOutputTokens = true
+			}
+		}
+		msgs[i] = msg
+	}
+	usageEvents := slices.Clone(dbResult.usageEvents)
+	for i := range usageEvents {
+		if usageEvents[i].OccurredAt != "" || i >= len(dbResult.usageEventStepIndices) {
+			continue
+		}
+		if ts, ok := brainTimeByIdx[dbResult.usageEventStepIndices[i]]; ok && !ts.IsZero() {
+			usageEvents[i].OccurredAt = ts.Format(time.RFC3339Nano)
+		}
+	}
+	return msgs, usageEvents
 }
 
 func mergeAntigravityDBHistoryMessages(
