@@ -1455,18 +1455,21 @@ func TestAntigravityCLIBrainTranscriptSourceSelection(t *testing.T) {
 	]}`
 	undecodableSteps := func(kinds ...int) func(*testing.T, *sql.DB) {
 		return func(t *testing.T, db *sql.DB) {
+			t.Helper()
 			for idx, kind := range kinds {
 				mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, X'00')`, idx, kind)
 			}
 		}
 	}
 	decodedSteps := func(t *testing.T, db *sql.DB) {
+		t.Helper()
 		mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (0, 14, ?)`,
 			antigravityTestStepPayload(1779000000, "user prompt text goes here"))
 		mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (1, 17, ?)`,
 			antigravityTestStepPayload(1779000100, "assistant reply content body"))
 	}
 	decodedStepsAroundUndecodableTool := func(t *testing.T, db *sql.DB) {
+		t.Helper()
 		mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (0, 14, ?)`,
 			antigravityTestStepPayload(1779000000, "user prompt text goes here"))
 		mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (1, 21, X'00')`)
@@ -1598,6 +1601,7 @@ func TestAntigravityCLIBrainTranscriptSourceSelection(t *testing.T) {
 func TestAntigravityGenMetadataDoesNotAttachToNonPlannerStep(t *testing.T) {
 	const id = "99999999-aaaa-bbbb-cccc-dddddddddddd"
 	path := antigravityCLIBrainFixture{setupDB: func(t *testing.T, db *sql.DB) {
+		t.Helper()
 		mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (0, 14, ?)`,
 			antigravityTestStepPayload(1779000000, "user prompt text goes here"))
 		mustExec(t, db, `CREATE TABLE gen_metadata (idx integer, data blob, size integer, PRIMARY KEY (idx))`)
@@ -1637,6 +1641,7 @@ func TestAntigravityBrainTranscriptGenMetadataTargetsModelEntry(t *testing.T) {
 		{
 			name: "undecodable user row hands usage to the missing output step",
 			steps: func(t *testing.T, db *sql.DB) {
+				t.Helper()
 				mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (0, 14, X'00')`)
 			},
 			wantModelIdx: 1,
@@ -1645,6 +1650,7 @@ func TestAntigravityBrainTranscriptGenMetadataTargetsModelEntry(t *testing.T) {
 		{
 			name: "undecodable non-planner last step keeps usage as an event",
 			steps: func(t *testing.T, db *sql.DB) {
+				t.Helper()
 				mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (0, 14, ?)`,
 					antigravityTestStepPayload(1779000000, "user prompt text goes here"))
 				mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (1, 21, X'00')`)
@@ -1655,6 +1661,7 @@ func TestAntigravityBrainTranscriptGenMetadataTargetsModelEntry(t *testing.T) {
 		{
 			name: "known non-planner last step keeps usage as an event",
 			steps: func(t *testing.T, db *sql.DB) {
+				t.Helper()
 				mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (0, 14, ?)`,
 					antigravityTestStepPayload(1779000000, "user prompt text goes here"))
 				mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (1, 21, ?)`,
@@ -1668,6 +1675,7 @@ func TestAntigravityBrainTranscriptGenMetadataTargetsModelEntry(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			path := antigravityCLIBrainFixture{
 				setupDB: func(t *testing.T, db *sql.DB) {
+					t.Helper()
 					tc.steps(t, db)
 					mustExec(t, db, `CREATE TABLE gen_metadata (idx integer, data blob, size integer, PRIMARY KEY (idx))`)
 					genData := createAntigravityMockGenMetadataForSteps(
