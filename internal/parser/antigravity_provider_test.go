@@ -1557,6 +1557,11 @@ func TestAntigravityCLIBrainTranscriptSourceSelection(t *testing.T) {
 			wantUnixMilli:  []int64{1779000000100, 1779000000900, 1779000030000},
 		},
 		{
+			name:         "empty db with an assistant-only brain transcript keeps history prompts",
+			fixture:      antigravityCLIBrainFixture{setupDB: func(*testing.T, *sql.DB) {}, transcript: assistantLine, history: history},
+			wantContents: []string{"Check deployment", "Healthy."},
+		},
+		{
 			name:         "pb assistant-only brain transcript keeps history prompts",
 			fixture:      antigravityCLIBrainFixture{pb: true, transcript: assistantLine, history: history},
 			wantContents: []string{"Check deployment", "Healthy."},
@@ -1636,6 +1641,16 @@ func TestAntigravityBrainTranscriptGenMetadataTargetsModelEntry(t *testing.T) {
 			},
 			wantModelIdx: 1,
 			wantOccurred: "2026-05-17T06:40:20Z",
+		},
+		{
+			name: "undecodable non-planner last step keeps usage as an event",
+			steps: func(t *testing.T, db *sql.DB) {
+				mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (0, 14, ?)`,
+					antigravityTestStepPayload(1779000000, "user prompt text goes here"))
+				mustExec(t, db, `INSERT INTO steps (idx, step_type, step_payload) VALUES (1, 21, X'00')`)
+			},
+			wantModelIdx: -1,
+			wantOccurred: "",
 		},
 		{
 			name: "known non-planner last step keeps usage as an event",

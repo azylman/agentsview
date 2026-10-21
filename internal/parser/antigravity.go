@@ -642,7 +642,9 @@ func generationPlannerStep(
 	steps []antigravityLoadedStep,
 	positions map[int]int,
 ) (int, bool) {
-	fallbackPos := -1
+	// An undecoded planner row still carries the usage so a brain
+	// transcript can claim it by step index. An undecoded row of any other
+	// kind is not chosen: its step_type column cannot show it is the output.
 	plannerPos := -1
 	for _, idx := range generation.stepIndices {
 		position, ok := positions[idx]
@@ -650,14 +652,6 @@ func generationPlannerStep(
 			continue
 		}
 		step := steps[position]
-		// An undecoded step of unknown kind may be the planner; carrying
-		// the usage there lets a brain transcript claim it by step index.
-		// Decoded non-planner steps and user steps are never the
-		// generation's output.
-		if fallbackPos < 0 && !step.decoded &&
-			step.kind != antigravityStepKindUserInput {
-			fallbackPos = position
-		}
 		if step.kind == antigravityStepKindPlannerResponse {
 			if step.decoded {
 				return position, true
@@ -670,9 +664,6 @@ func generationPlannerStep(
 	if generation.hasStepIndices {
 		if plannerPos >= 0 {
 			return plannerPos, true
-		}
-		if fallbackPos >= 0 {
-			return fallbackPos, true
 		}
 		return 0, false
 	}

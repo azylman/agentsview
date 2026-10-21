@@ -3941,17 +3941,16 @@ schemas keep their existing ordering behavior.
   lacks are added back. Generation metadata moves only onto the model's own
   transcript entries. Checkpointed WAL databases on read-only mounts without
   `.db-shm` or framed `-wal` sidecars fall back to `immutable=1`. An
-  unreadable database fails the parse unless a trajectory sidecar supplies the
-  transcript or only `history.jsonl` remains, which is stored for retry. The
-  CLI `history.jsonl` `workspace` value and the current CLI's
-  `cache/last_conversations.json` workspace-to-conversation mapping are
-  authoritative session CWD sources when the workspace is an absolute path.
-  Agentsview prefers the first valid current-cache folder for an exact
-  conversation ID, retains the strict prompt/time fallback for older untagged
-  history rows, and leaves CWD empty when the value is missing or relative.
-  The exact absolute workspace remains the CWD. The project label is derived
-  from the path text without probing the recorded folder when filesystem
-  discovery is disabled.
+  unreadable database fails the parse and keeps the archived session unless a
+  trajectory sidecar supplies the transcript. The CLI `history.jsonl`
+  `workspace` value and the current CLI's `cache/last_conversations.json`
+  workspace-to-conversation mapping are authoritative session CWD sources when
+  the workspace is an absolute path. Agentsview prefers the first valid
+  current-cache folder for an exact conversation ID, retains the strict
+  prompt/time fallback for older untagged history rows, and leaves CWD empty
+  when the value is missing or relative. The exact absolute workspace remains
+  the CWD. The project label is derived from the path text without probing the
+  recorded folder when filesystem discovery is disabled.
 
 ## iFlow CLI (`iflow`)
 

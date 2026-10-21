@@ -188,7 +188,12 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 			hasTrajectory = true
 			transcriptFidelity = TranscriptFidelityFull
 		case brainTranscriptOK && brainTranscriptCovers:
-			messages = brainTranscriptMsgs
+			// Coverage checks SQLite steps only. A prompt that neither
+			// SQLite nor the brain log has written yet is still in
+			// history.jsonl.
+			messages = appendMissingAntigravityHistoryMessages(
+				brainTranscriptMsgs, historyMsgs,
+			)
 			hasTrajectory = true
 			transcriptFidelity = TranscriptFidelityFull
 		case dbOK:
@@ -281,13 +286,13 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 		}
 	}
 
-	if ext == ".db" && dbErr != nil && !hasTrajectory &&
-		(brainTranscriptOK || (len(messages) == 0 && len(usageEvents) == 0)) {
+	if ext == ".db" && dbErr != nil && !hasTrajectory {
 		// Fail closed when the SQLite database could not be read and no
 		// trajectory sidecar supplied the transcript. This provider
-		// force-replaces stored messages, so a partial brain transcript or
-		// an empty session would delete archived replies. The parse error
-		// keeps the stored session, and sync retries failed files.
+		// force-replaces stored messages, so a brain transcript, history
+		// prompts, or an empty session would delete archived replies. The
+		// parse error keeps the stored session, and sync retries failed
+		// files.
 		return nil, nil, nil, status, dbErr
 	}
 
