@@ -30,6 +30,7 @@ import (
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/friction"
 	"go.kenn.io/agentsview/internal/ingest"
+	"go.kenn.io/agentsview/internal/lockctx"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/pathutil"
 	"go.kenn.io/agentsview/internal/secrets"
@@ -582,10 +583,12 @@ type Engine struct {
 	sourceClaimsMu    gosync.Mutex
 	sourceClaims      map[string]string
 	deferredSourceCwd *sourceCwdReconciliationBatch
-	// deferredAntigravityTitles holds rebuild title changes for archived
+	// deferredNativeTitles holds rebuild title changes for archived
 	// sessions that reach the replacement only through the orphan copy.
-	deferredAntigravityTitles map[string]*string
-	appliedAntigravityTitles  map[string]appliedAntigravityTitles
+	// Agents share it because every key carries its own agent prefix.
+	deferredNativeTitles map[string]*string
+	// Providers have distinct title-store paths, checked only while enabled.
+	appliedNativeTitles map[string]appliedNativeTitleStore
 	// sourceSet holds the provider set and session roots this engine
 	// discovers from. ReconfigureSources replaces it as one snapshot.
 	sourceSet atomic.Pointer[engineSources]
@@ -1833,15 +1836,15 @@ func (e *Engine) syncChangedPathsLocked(
 	})
 	ctx = parser.WithProjectRootMemo(ctx)
 	ctx = parser.WithCodexParentInventoryBatch(ctx)
-	e.invalidateAntigravityTitleCache(paths)
+	e.invalidateNativeTitleCache(paths)
 	stats, tombstoned, err = e.applyChangedPathSyncLocked(
 		ctx, e.prepareChangedPathSync(ctx, paths),
 	)
 	// Title store events carry no session files, so this also handles them.
 	if err == nil && !stats.Aborted {
 		var titleStats SyncStats
-		e.reconcileAntigravityTitlesLocked(ctx, &titleStats)
-		e.recordAntigravityTitleUpdates(titleStats)
+		e.reconcileNativeTitlesLocked(ctx, &titleStats)
+		e.recordNativeTitleUpdates(titleStats)
 		stats.TitlesUpdated += titleStats.TitlesUpdated
 		stats.Failed += titleStats.Failed
 	}
@@ -3495,8 +3498,8 @@ func (e *Engine) resyncBuildLocked(
 	e.deferredSourceCwd = deferredSourceCwd
 	defer func() { e.deferredSourceCwd = nil }()
 	deferredTitles := make(map[string]*string)
-	e.deferredAntigravityTitles = deferredTitles
-	defer func() { e.deferredAntigravityTitles = nil }()
+	e.deferredNativeTitles = deferredTitles
+	defer func() { e.deferredNativeTitles = nil }()
 	e.db = newDB
 	reportResyncPhase(
 		PhaseDiscovering,
@@ -3545,7 +3548,7 @@ func (e *Engine) resyncBuildLocked(
 		contributorEngine.archiveStore = origDB
 		contributorEngine.archiveRebuildIndex = archiveIndex
 		contributorEngine.deferredSourceCwd = deferredSourceCwd
-		contributorEngine.deferredAntigravityTitles = deferredTitles
+		contributorEngine.deferredNativeTitles = deferredTitles
 		contributorEngine.forceFullParse = contributor.ForceParse ||
 			contributor.ForceFullParseAfterCache
 		contributorEngine.forceFullParseAllowsCache =
@@ -3819,7 +3822,7 @@ func (e *Engine) resyncBuildLocked(
 			e.mu.Lock()
 			e.lastSyncStats = stats
 			e.mu.Unlock()
-			return stats, fmt.Errorf("apply deferred antigravity title: %w", err)
+			return stats, fmt.Errorf("apply deferred native title: %w", err)
 		}
 	}
 	deferredCwdUpdated, err := e.applyDeferredSourceCwd(ctx,
@@ -4985,6 +4988,22 @@ func (e *Engine) RunExclusive(work func() error) error {
 	return work()
 }
 
+// RunExclusiveCtx is RunExclusive for a caller that must stop waiting for the
+// lock when ctx ends, such as a push holding the daemon's push turn. It
+// returns ctx.Err() without running work if ctx ends before the lock is free.
+func (e *Engine) RunExclusiveCtx(ctx context.Context, work func() error) error {
+	if e.refuseWriteInForceParse("RunExclusiveCtx") {
+		return errors.New(
+			"RunExclusiveCtx refused on report-only parse-diff engine",
+		)
+	}
+	if err := lockctx.Lock(ctx, &e.syncMu); err != nil {
+		return err
+	}
+	defer e.syncMu.Unlock()
+	return work()
+}
+
 // ErrSyncInProgress reports that non-blocking foreground sync coordination
 // found another sync or maintenance pass holding the exclusive engine lock.
 var ErrSyncInProgress = errors.New("sync already in progress")
@@ -5033,6 +5052,39 @@ func (e *Engine) RunExclusiveFlushed(work func() error) error {
 	defer e.syncMu.Unlock()
 	e.signalSched.flushAllInline()
 	return work()
+}
+
+// SettleForPush waits for an in-progress sync to finish and then flushes
+// deferred signal recomputes, so a push that starts next copies settled
+// sessions. It does not hold the sync lock afterward: later syncs may write
+// while the push runs. If ctx ends first, SettleForPush returns ctx.Err() and
+// abandons the wait; the lock is released without flushing once acquired.
+func (e *Engine) SettleForPush(ctx context.Context) error {
+	if e.refuseWriteInForceParse("SettleForPush") {
+		return errors.New(
+			"SettleForPush refused on report-only parse-diff engine",
+		)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	var abandoned atomic.Bool
+	settled := make(chan struct{})
+	go func() {
+		defer close(settled)
+		e.syncMu.Lock()
+		defer e.syncMu.Unlock()
+		if !abandoned.Load() {
+			e.signalSched.flushAllInline()
+		}
+	}()
+	select {
+	case <-settled:
+		return nil
+	case <-ctx.Done():
+		abandoned.Store(true)
+		return ctx.Err()
+	}
 }
 
 // ApplyWorktreeReclassification serializes the mapping rule, historical
@@ -5398,8 +5450,8 @@ func (e *Engine) ReconcileProviderRootsGrouped(
 			e.flushFailureCache(ctx)
 		}
 		var titleStats SyncStats
-		e.reconcileAntigravityTitlesLocked(ctx, &titleStats)
-		e.recordAntigravityTitleUpdates(titleStats)
+		e.reconcileNativeTitlesLocked(ctx, &titleStats)
+		e.recordNativeTitleUpdates(titleStats)
 		changed = changed || titleStats.TitlesUpdated > 0
 	}()
 	if changed {
@@ -5476,8 +5528,8 @@ func (e *Engine) reconcileScopedWatchRootsLocked(
 	})
 	if !passEpilogueDeferred(ctx) {
 		var titleStats SyncStats
-		e.reconcileAntigravityTitlesLocked(ctx, &titleStats)
-		e.recordAntigravityTitleUpdates(titleStats)
+		e.reconcileNativeTitlesLocked(ctx, &titleStats)
+		e.recordNativeTitleUpdates(titleStats)
 		stats.TitlesUpdated += titleStats.TitlesUpdated
 		stats.Failed += titleStats.Failed
 	}
@@ -8181,7 +8233,7 @@ func (e *Engine) syncAllLocked(
 	if ctx.Err() != nil {
 		return SyncStats{Aborted: true}
 	}
-	e.invalidateAntigravityTitleCache(nil)
+	e.invalidateNativeTitleCache(nil)
 	ctx, closeProviderCache, err := e.withProviderFingerprintCache(ctx, nil)
 	if err != nil {
 		return SyncStats{Aborted: true, Warnings: []string{err.Error()}}
@@ -8487,7 +8539,7 @@ func (e *Engine) syncAllLocked(
 	} else {
 		stats.RecordLinksUpdated(linked)
 	}
-	e.reconcileAntigravityTitlesLocked(ctx, &stats)
+	e.reconcileNativeTitlesLocked(ctx, &stats)
 
 	e.reportFinalizingProgress(
 		onProgress, writeMode, finalizingSkipCacheDetail,

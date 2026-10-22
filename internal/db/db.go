@@ -592,7 +592,13 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // (139: a Codex cloud session with no token records and no plan usage
 // records gets an empty plan usage row, so usage reports count it as
 // billed as plan usage. Re-parse unchanged Codex cloud sources in place.)
-const dataVersion = 139
+// (140: strip gptme provider-routing suffixes from stored model IDs so catalog
+// pricing resolves. Re-parse unchanged gptme sources in place; source and
+// session identities are unchanged.)
+// (141: import provider-reported gptme costs as exact usage events. Re-parse
+// unchanged gptme sources in place; source and session identities are unchanged.)
+// (142: reparse classified dialogue in place.)
+const dataVersion = 142
 
 const archiveOnlyVersionBase = 1 << 20
 
@@ -659,8 +665,8 @@ var schemaSQL string
 // the two installation sites byte-identical.
 const messagesADTriggerDDL = `
 CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, content)
-        VALUES('delete', old.id, old.content);
+    INSERT INTO messages_fts(messages_fts, rowid, rendered, content)
+        VALUES('delete', old.id, old.content, COALESCE(old.dialogue_text, old.content));
 END;
 `
 
@@ -674,34 +680,38 @@ const messagesCJKADTriggerDDL = `
 CREATE TEMP TRIGGER IF NOT EXISTS messages_cjk_ad
 AFTER DELETE ON main.messages
 WHEN ` + cjkFTSRuntimeMatchesSQL + ` BEGIN
-    INSERT INTO messages_cjk_fts(messages_cjk_fts, rowid, content)
-        VALUES('delete', old.id, old.content);
+    INSERT INTO messages_cjk_fts(messages_cjk_fts, rowid, rendered, content)
+        VALUES('delete', old.id, old.content, COALESCE(old.dialogue_text, old.content));
 END;
 `
 
+// Each row indexes its full transcript in rendered and its dialogue in content.
 const schemaFTS = `
+CREATE VIEW IF NOT EXISTS message_search_content AS
+SELECT id, session_id, content AS rendered,
+    COALESCE(dialogue_text, content) AS content FROM messages;
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-    content,
-    content='messages',
+    content, rendered,
+    content='message_search_content',
     content_rowid='id',
     tokenize='porter unicode61'
 );
 
 CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
-    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+    INSERT INTO messages_fts(rowid, rendered, content) VALUES (new.id, new.content, COALESCE(new.dialogue_text, new.content));
 END;
 ` + messagesADTriggerDDL + `
 CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, content)
-        VALUES('delete', old.id, old.content);
-    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+    INSERT INTO messages_fts(messages_fts, rowid, rendered, content)
+        VALUES('delete', old.id, old.content, COALESCE(old.dialogue_text, old.content));
+    INSERT INTO messages_fts(rowid, rendered, content) VALUES (new.id, new.content, COALESCE(new.dialogue_text, new.content));
 END;
 `
 
 const schemaCJKFTS = `
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_cjk_fts USING fts5(
-    content,
-    content='messages',
+    content, rendered,
+    content='message_search_content',
     content_rowid='id',
     tokenize='simple 0'
 );
@@ -711,15 +721,15 @@ const schemaCJKFTSTriggers = `
 CREATE TEMP TRIGGER IF NOT EXISTS messages_cjk_ai
 AFTER INSERT ON main.messages
 WHEN ` + cjkFTSRuntimeMatchesSQL + ` BEGIN
-    INSERT INTO messages_cjk_fts(rowid, content) VALUES (new.id, new.content);
+    INSERT INTO messages_cjk_fts(rowid, rendered, content) VALUES (new.id, new.content, COALESCE(new.dialogue_text, new.content));
 END;
 ` + messagesCJKADTriggerDDL + `
 CREATE TEMP TRIGGER IF NOT EXISTS messages_cjk_au
 AFTER UPDATE ON main.messages
 WHEN ` + cjkFTSRuntimeMatchesSQL + ` BEGIN
-    INSERT INTO messages_cjk_fts(messages_cjk_fts, rowid, content)
-        VALUES('delete', old.id, old.content);
-    INSERT INTO messages_cjk_fts(rowid, content) VALUES (new.id, new.content);
+    INSERT INTO messages_cjk_fts(messages_cjk_fts, rowid, rendered, content)
+        VALUES('delete', old.id, old.content, COALESCE(old.dialogue_text, old.content));
+    INSERT INTO messages_cjk_fts(rowid, rendered, content) VALUES (new.id, new.content, COALESCE(new.dialogue_text, new.content));
 END;
 
 -- The persistent BEFORE triggers mark a session pending without consulting
@@ -1264,7 +1274,7 @@ type OpenProgress struct {
 	ResyncRequired bool
 }
 
-// OpenProgressFunc reports a database startup stage before its work begins.
+// OpenProgressFunc reports database startup stages and completed work.
 // Callbacks run synchronously and must not write to the archive.
 type OpenProgressFunc func(OpenProgress)
 
@@ -4819,18 +4829,24 @@ func (db *DB) DropFTS(ctx context.Context) error {
 		"DROP TRIGGER IF EXISTS messages_au",
 		"DROP TABLE IF EXISTS messages_fts",
 	}
-	w := db.getWriter()
+	// One transaction, so an interrupted drop cannot leave the index without
+	// its triggers while the corpus marker still says it is current.
+	tx, err := db.getWriter().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("drop fts: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
 	for _, s := range stmts {
-		if _, err := w.Exec(ctx, s); err != nil {
+		if _, err := tx.ExecContext(ctx, s); err != nil {
 			return fmt.Errorf("drop fts (%s): %w", s, err)
 		}
 	}
-	if _, err := w.Exec(ctx,
-		"DELETE FROM stats WHERE key = ?", cjkFTSFingerprintStatsKey,
+	if _, err := tx.ExecContext(ctx,
+		"DELETE FROM stats WHERE key IN (?, ?)", cjkFTSFingerprintStatsKey, searchCorpusVersionStatsKey,
 	); err != nil {
-		return fmt.Errorf("clearing CJK fts fingerprint: %w", err)
+		return fmt.Errorf("clearing FTS versions: %w", err)
 	}
-	return nil
+	return tx.Commit()
 }
 
 // RebuildFTS recreates the FTS table, triggers, and
@@ -4839,15 +4855,8 @@ func (db *DB) RebuildFTS(ctx context.Context) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	w := db.getWriter()
-	if _, err := w.Exec(ctx, schemaFTS); err != nil {
-		return fmt.Errorf("recreate fts: %w", err)
-	}
-	_, err := w.Exec(ctx,
-		"INSERT INTO messages_fts(messages_fts)"+
-			" VALUES('rebuild')",
-	)
-	if err != nil {
-		return fmt.Errorf("rebuild fts index: %w", err)
+	if err := rebuildMessageFTS(ctx, w, nil); err != nil {
+		return err
 	}
 	if err := ensureCJKFTS(ctx, w, true); err != nil {
 		return fmt.Errorf("rebuild CJK fts index: %w", err)
@@ -5025,6 +5034,16 @@ func (db *DB) init(ctx context.Context, progress OpenProgressFunc) error {
 		}
 	}
 
+	// This additive search column requires no schema-repair rebuild.
+	if err := applyColumnMigrations(
+		[]schemaColumnMigration{{"messages", "dialogue_text", "ALTER TABLE messages ADD COLUMN dialogue_text TEXT"}},
+		func(query string, args ...any) rowScanner { return w.QueryRowContext(ctx, query, args...) },
+		func(query string, args ...any) (sql.Result, error) { return w.ExecContext(ctx, query, args...) },
+		progress,
+	); err != nil {
+		return err
+	}
+
 	progress.report("Initializing full-text search")
 	var fts5Available bool
 	if err := w.QueryRowContext(ctx,
@@ -5042,29 +5061,18 @@ func (db *DB) init(ctx context.Context, progress OpenProgressFunc) error {
 		return fmt.Errorf("checking fts table: %w", err)
 	}
 	hadFTS := ftsCount > 0
-
-	// Attempt to initialize FTS. Failure is non-fatal
-	// (might be missing module).
-	if _, err := w.ExecContext(ctx, schemaFTS); err != nil {
-		if fts5Available {
-			return fmt.Errorf("initializing FTS: %w", err)
-		}
-	} else if hadFTS {
-		// IF NOT EXISTS skips the module lookup for an existing
-		// table, so an archive indexed by an fts5 build opens on an
-		// executable without fts5 and every message write then fails
-		// inside the messages triggers. Refuse the open instead.
+	if hadFTS {
 		if err := db.checkFTSModuleLoads(ctx, w); err != nil {
 			return err
 		}
-	} else {
-		// Schema init succeeded and we didn't have FTS
-		// before. Populate the index for existing messages.
-		if _, err := w.ExecContext(ctx,
-			"INSERT INTO messages_fts(messages_fts)"+
-				" VALUES('rebuild')",
-		); err != nil {
-			return fmt.Errorf("backfilling FTS: %w", err)
+	}
+	if fts5Available {
+		if !hadFTS {
+			if err := rebuildMessageFTS(ctx, w, progress); err != nil {
+				return err
+			}
+		} else if err := refreshDialogueFTS(ctx, w, progress); err != nil {
+			return err
 		}
 	}
 
@@ -5569,9 +5577,11 @@ func (db *DB) WriterClosed() bool {
 
 // Update executes fn within a write lock and transaction.
 // The transaction is committed if fn returns nil, rolled back
-// otherwise.
+// otherwise. It stops waiting for the lock when ctx ends.
 func (db *DB) Update(ctx context.Context, fn func(tx *sql.Tx) error) error {
-	db.mu.Lock()
+	if err := db.lockWriterCtx(ctx); err != nil {
+		return err
+	}
 	defer db.mu.Unlock()
 
 	// Fail fast before handing out a raw *sql.Tx: while the writer is closed
@@ -5620,7 +5630,9 @@ func scanSyncState(row *sql.Row) (string, error) {
 
 // SetSyncState writes a value to the pg_sync_state table.
 func (db *DB) SetSyncState(ctx context.Context, key, value string) error {
-	db.mu.Lock()
+	if err := db.lockWriterCtx(ctx); err != nil {
+		return err
+	}
 	defer db.mu.Unlock()
 	_, err := db.getWriter().Exec(ctx,
 		setSyncStateQuery,
@@ -5629,13 +5641,47 @@ func (db *DB) SetSyncState(ctx context.Context, key, value string) error {
 	return err
 }
 
+// ErrDatabaseReplaced reports that the archive was rebuilt since the caller
+// read its database ID.
+var ErrDatabaseReplaced = errors.New("the local archive was rebuilt")
+
+// SetSyncStatesForDatabase writes values to the pg_sync_state table in one
+// transaction, and only while the archive's database ID is still databaseID.
+// An archive swap cannot land between the writes, and a caller whose archive
+// was rebuilt gets ErrDatabaseReplaced instead of writing into the
+// replacement.
+func (db *DB) SetSyncStatesForDatabase(
+	ctx context.Context, databaseID string, values map[string]string,
+) error {
+	return db.Update(ctx, func(tx *sql.Tx) error {
+		var current string
+		if err := tx.QueryRowContext(ctx,
+			`SELECT value FROM archive_metadata WHERE key = ?`,
+			archiveMetadataDatabaseIDKey,
+		).Scan(&current); err != nil {
+			return fmt.Errorf("reading database id: %w", err)
+		}
+		if strings.TrimSpace(current) != databaseID {
+			return ErrDatabaseReplaced
+		}
+		for key, value := range values {
+			if _, err := tx.ExecContext(ctx, setSyncStateQuery, key, value); err != nil {
+				return fmt.Errorf("writing sync state %s: %w", key, err)
+			}
+		}
+		return nil
+	})
+}
+
 // DeleteSyncStateByPrefix removes every pg_sync_state row whose key starts
 // with prefix. Used to clean up state left behind by superseded sync
 // designs (e.g. the pre-schema-v3 DuckDB push watermarks, now tracked in
 // the mirror's own sync_metadata table instead of local pg_sync_state).
 // prefix is escaped so LIKE metacharacters in it (%, _) match literally.
 func (db *DB) DeleteSyncStateByPrefix(ctx context.Context, prefix string) error {
-	db.mu.Lock()
+	if err := db.lockWriterCtx(ctx); err != nil {
+		return err
+	}
 	defer db.mu.Unlock()
 	escaped := escapeSyncStatePrefix(prefix)
 	_, err := db.getWriter().Exec(ctx,
@@ -5697,7 +5743,9 @@ func escapeSyncStatePrefix(prefix string) string {
 // GetOrCreateSyncState returns a sync-state value, atomically creating it
 // with defaultValue when absent.
 func (db *DB) GetOrCreateSyncState(ctx context.Context, key, defaultValue string) (string, error) {
-	db.mu.Lock()
+	if err := db.lockWriterCtx(ctx); err != nil {
+		return "", err
+	}
 	defer db.mu.Unlock()
 	w := db.getWriter()
 	var value string

@@ -425,6 +425,25 @@ Antigravity sessions show the conversation title Antigravity saves in
 `conversation_summaries.db`. Renames appear shortly after that file changes,
 or on the next `agentsview sync`. Names set in AgentsView still win.
 
+Qoder's database title lookup applies to `~/.qoder/projects` and
+`~/.qoder-cn/projects`. The Qoder app stores titles in `main.sqlite` under
+its data directory: `com.qoder.app.stable` (or `com.qodercn.app.stable` for
+Qoder CN) inside `~/Library/Application Support` on macOS,
+`$XDG_CONFIG_HOME` or `~/.config` on Linux, and `%APPDATA%` on Windows. If
+you moved the app's data directory, AgentsView does not find it. Names take
+precedence in this order:
+
+1. A name set in AgentsView.
+2. A non-blank database title.
+3. A file-side name, with a sidecar title ahead of an in-chat rename.
+
+Renames appear at the next sync pass: a watched change in any agent root,
+manual `agentsview sync`, or startup. For these two roots, blank database
+titles or read errors preserve the archived name. A missing database, schema,
+or session row uses non-empty file-side names; an empty file-side name
+preserves the archived title. Other Qoder roots use file-side names, including
+clearing the archived title when empty.
+
 When a session has a native resume target, the sidebar also exposes a direct
 native session link so supported agents can reopen their own session instead of
 only navigating inside AgentsView.
@@ -1026,7 +1045,7 @@ sessions. Results update after a 300ms typing pause.
 
 !!! tip
 
-    For deeper searches across full transcripts — including tool inputs, tool result
+    For deeper searches across full transcripts — including thinking, tool inputs, tool result
     content, and regex patterns — use the
     [`agentsview session search`](/docs/session-api/#agentsview-session-search) CLI
     or the `GET /api/v1/search/content` HTTP endpoint added in 0.30.0. The command
@@ -1397,7 +1416,8 @@ The **Chart colors** control selects the categorical palette used by the
 dashboard skill trend, Trends, and Usage charts. Choose **Agentsview** for the
 project palette or **Matplotlib** for its gray-free categorical families. This
 setting is server-wide rather than browser-local, so all clients connected to
-the same writable server use the same palette.
+the same server use the same palette. You can change it even when the server
+reads from a read-only store such as PostgreSQL, ClickHouse, or DuckDB.
 
 ### Iframe Embedding
 

@@ -44,6 +44,19 @@ func newPushVersion() uint64 {
 func (s *Sync) PushWithOptions(
 	ctx context.Context, opts storage.PushOptions, onProgress func(storage.PushProgress),
 ) (storage.PushResult, error) {
+	s.fullRunRecorded = false
+	result, err := s.pushWithOptions(ctx, opts, onProgress)
+	if err != nil && opts.Full && !s.fullRunRecorded {
+		// The push failed before it recorded the requested full push, so
+		// nothing can resume it.
+		err = storage.PushNotStartedError{Err: err}
+	}
+	return result, err
+}
+
+func (s *Sync) pushWithOptions(
+	ctx context.Context, opts storage.PushOptions, onProgress func(storage.PushProgress),
+) (storage.PushResult, error) {
 	start := time.Now()
 	var result storage.PushResult
 	if err := s.EnsureSchema(ctx); err != nil {
@@ -57,7 +70,10 @@ func (s *Sync) PushWithOptions(
 		onProgress(storage.PushProgress{Phase: "preparing"})
 	}
 	version := newPushVersion()
-	cutoff := time.Now().UTC().Format(localSyncTimestampLayout)
+	cutoff, err := s.local.MirrorPushCutoff(ctx)
+	if err != nil {
+		return result, err
+	}
 
 	meta, err := readMetadata(ctx, conn,
 		s.archiveKey(lastPushCutoffKeyBase),
@@ -66,6 +82,7 @@ func (s *Sync) PushWithOptions(
 		s.archiveKey(identityRevisionKeyBase),
 		s.archiveKey(mappingRevisionKeyBase),
 		s.archiveKey(usageSnapshotReadyKeyBase),
+		s.archiveKey(messageDialogueReadyKeyBase),
 		s.archiveKey(storedCountRepairKeyBase),
 		s.archiveKey(databaseIDKeyBase),
 		s.archiveKey(fullPushRunKeyBase),
@@ -92,6 +109,9 @@ func (s *Sync) PushWithOptions(
 	}
 	if !full && meta[s.archiveKey(usageSnapshotReadyKeyBase)] == "" {
 		full, reason = true, "preparing complete usage snapshots"
+	}
+	if !full && meta[s.archiveKey(messageDialogueReadyKeyBase)] == "" {
+		full, reason = true, "preparing message dialogue"
 	}
 	// Rows from before stored_message_count, or from an older writer, read as unknown until a full push republishes them.
 	repairing := meta[s.archiveKey(storedCountRepairKeyBase)] != ""
@@ -191,6 +211,7 @@ func (s *Sync) PushWithOptions(
 		if err := writeMetadata(ctx, conn, map[string]string{s.archiveKey(fullPushRunKeyBase): encoded}); err != nil {
 			return result, err
 		}
+		s.fullRunRecorded = true
 	}
 	if !full {
 		if err := s.applyDeletionDelta(ctx, storedDeletion, localDeletion, &result); err != nil {
@@ -324,6 +345,7 @@ func (s *Sync) PushWithOptions(
 			pushed[s.archiveKey(storedCountRepairKeyBase)] = ""
 		}
 		if full {
+			pushed[s.archiveKey(messageDialogueReadyKeyBase)] = cutoff
 			pushed[s.archiveKey(fullPushRunKeyBase)] = ""
 		}
 		if err := writeMetadata(ctx, conn, pushed); err != nil {
@@ -1004,7 +1026,7 @@ func lastMessageAt(msgs []db.Message) *time.Time {
 
 func messageRow(m db.Message, version uint64) []any {
 	return []any{
-		m.ID, m.SessionID, int64(m.Ordinal), m.Role, m.Content, m.ThinkingText,
+		m.ID, m.SessionID, int64(m.Ordinal), m.Role, m.Content, m.ThinkingText, m.DialogueText,
 		timeValue(m.Timestamp), m.HasThinking, m.HasToolUse, int64(m.ContentLength),
 		m.IsSystem, m.Model, m.ReasoningEffort, string(m.TokenUsage),
 		int64(m.ContextTokens), int64(m.OutputTokens), m.ProviderID,

@@ -478,6 +478,8 @@ func (d *DB) CopySyncStateFrom(sourcePath string) error {
 			WHERE key = 'pg_push_marker_id'
 			   OR key = 'pg_full_push_run_v1'
 			   OR key LIKE 'pg\_full\_push\_run\_v1:%' ESCAPE '\'
+			   OR key = 'pg_push_state_saved_v1'
+			   OR key LIKE 'pg\_push\_state\_saved\_v1:%' ESCAPE '\'
 			   OR key LIKE 'artifact\_%' ESCAPE '\'
 			   OR key LIKE 'machine\_label:%' ESCAPE '\'
 			   OR key LIKE 'machine\_alias:%' ESCAPE '\'
@@ -2396,7 +2398,7 @@ func copySessionDataForIDs(
 		"source_type", "source_subtype", "prompt_source",
 		"source_uuid", "source_parent_uuid",
 		"is_sidechain", "is_compact_boundary",
-		"thinking_text",
+		"thinking_text", "dialogue_text",
 	} {
 		if oldDBHasColumn(ctx, tx, "messages", c) {
 			msgCols.WriteString(", " + c)

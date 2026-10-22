@@ -548,8 +548,12 @@ instead of writing directly.
 Set `AGENTSVIEW_NO_DAEMON=1` to disable daemon auto-start. Commands that require
 the daemon refuse while it is disabled. Direct write commands acquire the local
 write-owner lock before opening SQLite. If another process owns that lock, the
-command refuses and asks you to stop the daemon, wait for idle shutdown, or
-retry after the offline operation finishes.
+command refuses. If `agentsview daemon status` shows a daemon, run
+`agentsview daemon stop`; otherwise find the agentsview process holding the
+lock file, then wait for it to finish or stop it. Auto-start (MCP and CLI
+commands that start a server on their own) reports the holder in the same way
+instead of launching a server that could not open the archive. `daemon start`
+and `serve --background` report the child's failure as before.
 
 ______________________________________________________________________
 
@@ -2242,6 +2246,7 @@ agentsview help
 | `AGENTSVIEW_NO_DAEMON`                |                                                      | Set to `1`, `true`, `yes`, or `on` to disable CLI daemon auto-start                                 |
 | `AGENTSVIEW_DAEMON_IDLE_TIMEOUT`      | `20m`                                                | Override idle self-shutdown duration for detached background daemons                                |
 | `AGENTSVIEW_TELEMETRY_ENABLED`        |                                                      | Set to `0` to disable [anonymous daemon telemetry](/docs/configuration/#anonymous-daemon-telemetry) |
+| `DO_NOT_TRACK`                        |                                                      | Set to `1` to disable telemetry                                                                     |
 
 Environment variables override the built-in defaults. Set them in your shell
 profile or pass them inline:

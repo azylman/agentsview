@@ -4,6 +4,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/spf13/pflag"
@@ -119,6 +120,63 @@ func TestScopedPGConnectionDeploymentOverride(t *testing.T) {
 					assert.Equal(t, value == "true", pg.AllowInsecure)
 				}
 			}
+		})
+	}
+}
+
+// A mistyped AGENTSVIEW_MODE makes serve refuse to start. Other commands must
+// not apply deployment secrets or the PG insecure override under it: a reader
+// reports the mode once one of its variables is set, and is a no-op otherwise.
+func TestInvalidDeploymentModeAppliesNoDeploymentSettings(t *testing.T) {
+	for _, tt := range []struct {
+		name, env, value string
+		// apply reports whether the deployment value took effect.
+		apply func(cfg *Config) (bool, error)
+		// validate replaces apply for a reader whose error is its only
+		// observable result.
+		validate func(cfg *Config) error
+	}{
+		{name: "auth token file", env: "AGENTSVIEW_AUTH_TOKEN_FILE", value: "deployment-secret", apply: func(cfg *Config) (bool, error) {
+			err := cfg.ApplyDeploymentAuth()
+			return cfg.AuthToken != "", err
+		}},
+		{name: "embeddings", env: "AGENTSVIEW_EMBEDDINGS_ENDPOINT", value: "http://127.0.0.1:30000/v1", apply: func(cfg *Config) (bool, error) {
+			err := cfg.ApplyDeploymentEmbeddings()
+			return cfg.DeploymentEmbeddings != nil, err
+		}},
+		{name: "pg allow insecure", env: "AGENTSVIEW_PG_ALLOW_INSECURE", value: "true", apply: func(cfg *Config) (bool, error) {
+			pg, err := cfg.ResolvePG()
+			return pg.AllowInsecure, err
+		}},
+		{name: "hosted raw auth policy", env: "AGENTSVIEW_REQUIRE_AUTH", value: "false", validate: func(cfg *Config) error {
+			// Applying false would fail with the auth requirement instead.
+			return cfg.ValidatePGRawDerivation(PGConfig{Schema: "tenant_schema", RawTenant: "tenant"})
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			unsetDeploymentEnv(t)
+			dir := setupTestEnv(t)
+			writeConfig(t, dir, map[string]any{"pg": map[string]any{"url": "postgres://db.example/archive"}})
+			cfg, err := LoadMinimalFor(ScopeLocal)
+			require.NoError(t, err)
+			cfg.RequireAuth = true
+			t.Setenv("AGENTSVIEW_MODE", "srve")
+			check := func() error {
+				if tt.validate != nil {
+					return tt.validate(&cfg)
+				}
+				applied, err := tt.apply(&cfg)
+				assert.False(t, applied)
+				return err
+			}
+			require.NoError(t, check(), "a reader with no variables set ignores the mode")
+
+			value := tt.value
+			if strings.HasSuffix(tt.env, "_FILE") {
+				value = writeSecret(t, t.TempDir(), "secret", tt.value)
+			}
+			t.Setenv(tt.env, value)
+			require.ErrorContains(t, check(), `AGENTSVIEW_MODE must be "serve" or "pg-serve", got "srve"`)
 		})
 	}
 }
