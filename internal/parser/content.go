@@ -13,22 +13,23 @@ import (
 // content can be a string or a JSON array of blocks.
 // Returns: flattened text (with inline [Thinking] markers for UI
 // compatibility), concatenated thinking-block text (no markers),
-// hasThinking, hasToolUse, tool calls, and tool results.
+// dialogue text, hasThinking, hasToolUse, tool calls, and tool results.
 // Thinking blocks are joined with "\n\n" to give an unambiguous
 // block boundary in the concatenated thinking text.
 func ExtractTextContent(
 	ctx context.Context, content gjson.Result,
-) (string, string, bool, bool, []ParsedToolCall, []ParsedToolResult) {
+) (string, string, string, bool, bool, []ParsedToolCall, []ParsedToolResult) {
 	if content.Type == gjson.String {
-		return content.Str, "", false, false, nil, nil
+		return content.Str, "", content.Str, false, false, nil, nil
 	}
 
 	if !content.IsArray() {
-		return "", "", false, false, nil, nil
+		return "", "", "", false, false, nil, nil
 	}
 
 	var (
 		parts         []string
+		dialogueParts []string
 		thinkingParts []string
 		toolCalls     []ParsedToolCall
 		toolResults   []ParsedToolResult
@@ -41,6 +42,7 @@ func ExtractTextContent(
 			text := block.Get("text").Str
 			if text != "" {
 				parts = append(parts, text)
+				dialogueParts = append(dialogueParts, text)
 			}
 		case "thinking":
 			thinking := block.Get("thinking").Str
@@ -72,7 +74,7 @@ func ExtractTextContent(
 	})
 
 	return strings.Join(parts, "\n"),
-		strings.Join(thinkingParts, "\n\n"),
+		strings.Join(thinkingParts, "\n\n"), strings.Join(dialogueParts, "\n"),
 		hasThinking, hasToolUse, toolCalls, toolResults
 }
 
@@ -716,7 +718,9 @@ func grokToolUseRendering(name, inputJSON string) string {
 		}
 		payload = gjson.Parse(input)
 	default:
-		return ""
+		// Native Grok Build tools render from their own arguments.
+		rendering, _ := grokNativeToolRendering(name, input)
+		return rendering
 	}
 	return grokBackendToolSummary(name, payload)
 }

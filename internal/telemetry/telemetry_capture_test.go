@@ -50,6 +50,7 @@ func TestCoreActionAllowlist(t *testing.T) {
 		{EventScreenViewed, "screen", "pinned", true},
 		{EventScreenViewed, "screen", "trash", true},
 		{EventScreenViewed, "screen", "recent-edits", true},
+		{EventScreenViewed, "screen", "friction", true},
 		{EventScreenViewed, "screen", "data", true},
 		{EventScreenViewed, "screen", "settings", true},
 		{EventScreenViewed, "screen", "unknown", false},
@@ -164,6 +165,7 @@ func TestScreenViewWithoutScreenLeavesValidRetry(t *testing.T) {
 }
 
 func TestScreenViewDisabled(t *testing.T) {
+	clearTelemetryVetoes(t)
 	t.Setenv(EnabledEnv, "0")
 	t.Setenv(GenericEnabledEnv, "1")
 	path := filepath.Join(t.TempDir(), "screens")
@@ -228,12 +230,13 @@ func captureCollector(t *testing.T) (string, func() []capturedEvent) {
 
 func captureReporter(t *testing.T, endpoint string, opts Options) *Reporter {
 	t.Helper()
+	clearTelemetryVetoes(t)
 	if opts.ScreenClaimsPath == "" {
 		opts.ScreenClaimsPath = filepath.Join(t.TempDir(), "screens")
 	}
 	client, err := kittelemetry.NewReporter(kittelemetry.Options{
 		APIKey: "phc_test", Application: application, EnvPrefix: envPrefix,
-		DistinctID: "install-id", Source: "daemon", Endpoint: endpoint,
+		DistinctID: "install-id", Source: "daemon", Endpoint: endpoint, Version: "v1.2.3",
 	}, allowedEventOptions(opts)...)
 	require.NoError(t, err)
 	return &Reporter{client: client}

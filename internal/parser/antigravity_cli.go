@@ -12,6 +12,8 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -74,6 +76,8 @@ type AntigravityCLIParseStatus struct {
 	// messages instead. Sync can store the fallback while leaving
 	// data_version stale so the next pass retries.
 	NeedsRetry bool
+	// summaryDigest condenses the summary values the parse read.
+	summaryDigest string
 }
 
 // parseSessionWithStatus parses one CLI session into the canonical
@@ -121,11 +125,25 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 	// stays empty for legacy .pb and sidecar-only sessions where no schema
 	// is available, so SourceVersion is never fabricated.
 	var sourceVersion string
-	brainTranscriptMsgs, brainTranscriptErr := collectAntigravityBrainTranscriptMessages(
+	brainTranscriptSteps, brainTranscriptErr := collectAntigravityBrainTranscriptSteps(
 		antigravityBrainTranscriptPath(root, id),
 	)
 	if brainTranscriptErr != nil && !os.IsNotExist(brainTranscriptErr) {
 		return nil, nil, nil, status, brainTranscriptErr
+	}
+	historyMsgs := collectAntigravityHistoryMessages(
+		filepath.Join(root, "history.jsonl"), id,
+	)
+	historyPrompts := make(map[string]struct{}, len(historyMsgs))
+	for _, msg := range historyMsgs {
+		// SQLite decoding trims outer whitespace before normalization.
+		historyPrompts[strings.TrimSpace(msg.Content)] = struct{}{}
+	}
+	brainTranscriptMsgs := make([]ParsedMessage, len(brainTranscriptSteps))
+	for i := range brainTranscriptSteps {
+		msg := &brainTranscriptSteps[i].msg
+		normalizeAntigravityCLIUserMessage(msg, historyPrompts)
+		brainTranscriptMsgs[i] = *msg
 	}
 	brainTranscriptOK := hasDisplayableAntigravityCLITrajectoryMessage(
 		brainTranscriptMsgs,
@@ -135,6 +153,9 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 	if ext == ".db" {
 		var dbResult antigravityStepLoadResult
 		dbResult, dbErr = loadAntigravityCLIDBSteps(ctx, path)
+		for i := range dbResult.messages {
+			normalizeAntigravityCLIUserMessage(&dbResult.messages[i], historyPrompts)
+		}
 		sourceVersion = dbResult.sourceVersion
 		hasGenMetadata = dbResult.hasGenMetadata
 		// gen_metadata token usage describes the session's actual
@@ -144,6 +165,11 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 		// (unreadable DB or missing gen_metadata table) so the same
 		// generation is never counted twice.
 		usageEvents = dbResult.usageEvents
+		if brainTranscriptOK && dbErr == nil {
+			brainTranscriptMsgs, usageEvents = applyAntigravityBrainStepMetadata(
+				brainTranscriptSteps, dbResult,
+			)
+		}
 		dbOK := dbErr == nil &&
 			hasDisplayableAntigravityCLITrajectoryMessage(dbResult.messages)
 
@@ -160,6 +186,9 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 		tRes, tErr := parseAntigravityCLITrajectory(
 			sidecarPath, dbResult.executors,
 		)
+		for i := range tRes.messages {
+			normalizeAntigravityCLIUserMessage(&tRes.messages[i], historyPrompts)
+		}
 		if tErr == nil {
 			parentCascadeID = tRes.parentCascadeID
 		}
@@ -167,23 +196,25 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 			hasDisplayableAntigravityCLITrajectoryMessage(tRes.messages)
 		sidecarCovers := dbErr != nil || dbResult.rawStepCount == 0 ||
 			tRes.rawSteps >= dbResult.rawStepCount
-		brainTranscriptCovers := dbErr != nil || len(dbResult.messages) == 0 ||
-			len(brainTranscriptMsgs) >= len(dbResult.messages)
+		brainTranscriptCovers := dbErr == nil &&
+			antigravityBrainTranscriptCoversDB(brainTranscriptSteps, dbResult.steps)
 		switch {
 		case sidecarOK && sidecarCovers:
 			messages = tRes.messages
 			hasTrajectory = true
 			transcriptFidelity = TranscriptFidelityFull
 		case brainTranscriptOK && brainTranscriptCovers:
-			messages = brainTranscriptMsgs
+			// Coverage checks SQLite steps only. A prompt that neither
+			// SQLite nor the brain log has written yet is still in
+			// history.jsonl.
+			messages = appendMissingAntigravityHistoryMessages(
+				brainTranscriptMsgs, historyMsgs,
+			)
 			hasTrajectory = true
 			transcriptFidelity = TranscriptFidelityFull
 		case dbOK:
 			messages = mergeAntigravityDBHistoryMessages(
-				dbResult.messages,
-				collectAntigravityHistoryMessages(
-					filepath.Join(root, "history.jsonl"), id,
-				),
+				dbResult.messages, historyMsgs,
 			)
 			hasTrajectory = true
 		case sidecarOK:
@@ -193,8 +224,12 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 			messages = tRes.messages
 			hasTrajectory = true
 			status.NeedsRetry = true
-		case brainTranscriptOK:
-			messages = brainTranscriptMsgs
+		case dbErr == nil && brainTranscriptOK:
+			// A partial brain log can miss user turns that history.jsonl
+			// recorded, so fold those back in.
+			messages = appendMissingAntigravityHistoryMessages(
+				brainTranscriptMsgs, historyMsgs,
+			)
 			hasTrajectory = true
 			status.NeedsRetry = true
 		case dbErr != nil || dbResult.rawStepCount > 0:
@@ -220,6 +255,9 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 		if tRes, err := parseAntigravityCLITrajectory(
 			sidecarPath, nil,
 		); err == nil {
+			for i := range tRes.messages {
+				normalizeAntigravityCLIUserMessage(&tRes.messages[i], historyPrompts)
+			}
 			parentCascadeID = tRes.parentCascadeID
 			// Usage events flow whenever the sidecar parses, even when
 			// no message is displayable, matching the message-less
@@ -238,16 +276,18 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 			}
 		}
 		if !hasTrajectory && brainTranscriptOK {
-			messages = brainTranscriptMsgs
+			// .pb sessions have no step rows to prove coverage, so history
+			// prompts the brain log missed are folded back in.
+			messages = appendMissingAntigravityHistoryMessages(
+				brainTranscriptMsgs, historyMsgs,
+			)
 			hasTrajectory = true
 			transcriptFidelity = TranscriptFidelityFull
 		}
 	}
 
 	if !hasTrajectory {
-		messages = collectAntigravityHistoryMessages(
-			filepath.Join(root, "history.jsonl"), id,
-		)
+		messages = historyMsgs
 	}
 	messages = append(
 		messages,
@@ -265,10 +305,13 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 		}
 	}
 
-	if ext == ".db" && dbErr != nil && len(messages) == 0 && len(usageEvents) == 0 {
+	if ext == ".db" && dbErr != nil && !hasTrajectory {
 		// Fail closed when the SQLite database could not be read and no
-		// fallback source supplied messages or usage events, so sync does
-		// not clobber a previously stored transcript with an empty session.
+		// trajectory sidecar supplied the transcript. This provider
+		// force-replaces stored messages, so a brain transcript, history
+		// prompts, or an empty session would delete archived replies. The
+		// parse error keeps the stored session, and sync retries failed
+		// files.
 		return nil, nil, nil, status, dbErr
 	}
 
@@ -375,6 +418,13 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 			Mtime: mtime,
 		},
 	}
+	summaries := loadAntigravitySummaries(ctx, root)
+	status.summaryDigest = summaries.fingerprintDigest(id)
+	if parentCascadeID == "" {
+		// Without the reader sidecar, the summary store still names the
+		// conversation that started a sub-agent conversation.
+		parentCascadeID = summaries.parent(id)
+	}
 	if parentCascadeID != "" && !strings.EqualFold(parentCascadeID, id) {
 		sess.ParentSessionID = antigravityCLIIDPrefix + parentCascadeID
 		sess.RelationshipType = RelSubagent
@@ -421,11 +471,12 @@ func loadAntigravityCLIDBSteps(ctx context.Context,
 	result, err := loadAntigravityCLIDBStepsWithOptions(
 		ctx, path, sqliteReadOptions{},
 	)
-	if err != nil {
+	if err != nil && !sqliteWALHasFrames(path+"-wal") {
 		// When a WAL database has been cleanly checkpointed and closed by
 		// agy (unlinking .db-shm) on a read-only filesystem mount, SQLite
 		// cannot create the shared-memory index in mode=ro and fails with
-		// SQLITE_CANTOPEN. Retry once with immutable=1 (stableSnapshot).
+		// SQLITE_CANTOPEN. When no data-bearing -wal sidecar is present,
+		// retry once with immutable=1 (stableSnapshot).
 		if retry, retryErr := loadAntigravityCLIDBStepsWithOptions(
 			ctx, path, sqliteReadOptions{stableSnapshot: true},
 		); retryErr == nil {
@@ -462,6 +513,86 @@ func loadAntigravityCLIDBStepsWithOptions(
 	return result, nil
 }
 
+// antigravityBrainTranscriptCoversDB reports whether the brain transcript
+// accounts for every SQLite step. Each step needs a transcript line at the
+// same index. A decoded step and any user or planner step need a
+// displayable line; for other undecodable steps, an empty line shows the
+// step logged nothing. A missing line proves nothing, so it fails coverage.
+func antigravityBrainTranscriptCoversDB(
+	brainSteps []antigravityBrainTranscriptStep,
+	dbSteps []antigravityLoadedStep,
+) bool {
+	displayable := make(map[int]bool, len(brainSteps))
+	for _, bs := range brainSteps {
+		displayable[bs.stepIndex] = displayable[bs.stepIndex] ||
+			hasDisplayableAntigravityCLITrajectoryMessage(
+				[]ParsedMessage{bs.msg},
+			)
+	}
+	for _, step := range dbSteps {
+		hasContent, logged := displayable[step.idx]
+		if !logged {
+			return false
+		}
+		needsContent := step.decoded ||
+			step.kind == antigravityStepKindUserInput ||
+			step.kind == antigravityStepKindPlannerResponse
+		if needsContent && !hasContent {
+			return false
+		}
+	}
+	return true
+}
+
+func applyAntigravityBrainStepMetadata(
+	brainSteps []antigravityBrainTranscriptStep,
+	dbResult antigravityStepLoadResult,
+) ([]ParsedMessage, []ParsedUsageEvent) {
+	dbStepByIdx := make(map[int]ParsedMessage,
+		len(dbResult.steps)+len(dbResult.metadataSteps))
+	for _, s := range slices.Concat(dbResult.steps, dbResult.metadataSteps) {
+		dbStepByIdx[s.idx] = s.msg
+	}
+	// Generation metadata describes model output, so only the model's own
+	// entries take its model, tokens, and timestamp.
+	brainTimeByIdx := make(map[int]time.Time, len(brainSteps))
+	msgs := make([]ParsedMessage, len(brainSteps))
+	for i, bs := range brainSteps {
+		msg := bs.msg
+		msgs[i] = msg
+		if msg.Role != RoleAssistant {
+			continue
+		}
+		if !msg.Timestamp.IsZero() {
+			brainTimeByIdx[bs.stepIndex] = msg.Timestamp
+		}
+		if dbMsg, ok := dbStepByIdx[bs.stepIndex]; ok {
+			if msg.Model == "" && dbMsg.Model != "" {
+				msg.Model = dbMsg.Model
+			}
+			if !msg.HasContextTokens && dbMsg.HasContextTokens {
+				msg.ContextTokens = dbMsg.ContextTokens
+				msg.HasContextTokens = true
+			}
+			if !msg.HasOutputTokens && dbMsg.HasOutputTokens {
+				msg.OutputTokens = dbMsg.OutputTokens
+				msg.HasOutputTokens = true
+			}
+		}
+		msgs[i] = msg
+	}
+	usageEvents := slices.Clone(dbResult.usageEvents)
+	for i := range usageEvents {
+		if usageEvents[i].OccurredAt != "" || i >= len(dbResult.usageEventStepIndices) {
+			continue
+		}
+		if ts, ok := brainTimeByIdx[dbResult.usageEventStepIndices[i]]; ok && !ts.IsZero() {
+			usageEvents[i].OccurredAt = ts.Format(time.RFC3339Nano)
+		}
+	}
+	return msgs, usageEvents
+}
+
 func mergeAntigravityDBHistoryMessages(
 	dbMessages []ParsedMessage, history []ParsedMessage,
 ) []ParsedMessage {
@@ -473,12 +604,17 @@ func mergeAntigravityDBHistoryMessages(
 		return dbMessages
 	}
 	userCount := 0
+	unmatchedTypedPrompt := false
 	for _, msg := range dbMessages {
 		if msg.Role == RoleUser {
+			if msg.antigravityTypedPrompt && userCount < len(history) && normalizedAntigravityPrompt(msg.Content) != normalizedAntigravityPrompt(history[userCount].Content) {
+				unmatchedTypedPrompt = true
+			}
 			userCount++
 		}
 	}
-	if userCount != len(history) {
+	// Positional overwrite would replace a typed prompt missing from history.
+	if userCount != len(history) || unmatchedTypedPrompt {
 		return appendMissingAntigravityHistoryMessages(
 			dbMessages, history,
 		)
@@ -493,8 +629,10 @@ func mergeAntigravityDBHistoryMessages(
 				dbMessages, history,
 			)
 		}
-		dbMessages[i].Content = history[historyIdx].Content
-		dbMessages[i].ContentLength = len(history[historyIdx].Content)
+		if !dbMessages[i].antigravityTypedPrompt {
+			dbMessages[i].Content = history[historyIdx].Content
+			dbMessages[i].ContentLength = len(history[historyIdx].Content)
+		}
 		if !history[historyIdx].Timestamp.IsZero() {
 			dbMessages[i].Timestamp = history[historyIdx].Timestamp
 		}
@@ -503,35 +641,106 @@ func mergeAntigravityDBHistoryMessages(
 	return dbMessages
 }
 
+// appendMissingAntigravityHistoryMessages appends history prompts that no
+// existing user turn accounts for. Repeated prompts are matched one to one:
+// first by exact timestamp, then by the same second (for sources that record
+// whole seconds), then by text alone, so each history row keeps its own turn.
 func appendMissingAntigravityHistoryMessages(
 	dbMessages []ParsedMessage, history []ParsedMessage,
 ) []ParsedMessage {
-	seen := make(map[string]struct{})
-	for _, msg := range dbMessages {
-		if msg.Role != RoleUser {
-			continue
-		}
-		if key := normalizedAntigravityPrompt(msg.Content); key != "" {
-			seen[key] = struct{}{}
+	type existingUserTurn struct {
+		key  string
+		ts   time.Time
+		used bool
+		idx  int
+	}
+	var existing []existingUserTurn
+	for idx, msg := range dbMessages {
+		if msg.Role == RoleUser {
+			if key := normalizedAntigravityPrompt(msg.Content); key != "" {
+				existing = append(existing, existingUserTurn{key: key, ts: msg.Timestamp, idx: idx})
+			}
 		}
 	}
-	out := dbMessages
-	for _, msg := range history {
-		key := normalizedAntigravityPrompt(msg.Content)
-		if key == "" {
-			continue
-		}
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		out = append(out, msg)
-		seen[key] = struct{}{}
+	matchers := []func(existing, want time.Time) bool{
+		func(existing, want time.Time) bool {
+			return !existing.IsZero() && !want.IsZero() && existing.Equal(want)
+		},
+		func(existing, want time.Time) bool {
+			return !existing.IsZero() && !want.IsZero() &&
+				existing.Unix() == want.Unix()
+		},
+		func(time.Time, time.Time) bool { return true },
 	}
-	return out
+	keys := make([]string, len(history))
+	matched := make([]bool, len(history))
+	for hIdx, msg := range history {
+		keys[hIdx] = normalizedAntigravityPrompt(msg.Content)
+		matched[hIdx] = keys[hIdx] == ""
+	}
+	for _, sameTurn := range matchers {
+		for hIdx, msg := range history {
+			if matched[hIdx] {
+				continue
+			}
+			for i := range existing {
+				if !existing[i].used && existing[i].key == keys[hIdx] &&
+					sameTurn(existing[i].ts, msg.Timestamp) {
+					existing[i].used = true
+					matched[hIdx] = true
+					if dbMessages[existing[i].idx].Timestamp.IsZero() && !slices.ContainsFunc(dbMessages[existing[i].idx+1:], func(m ParsedMessage) bool { return m.Timestamp.IsZero() }) {
+						dbMessages[existing[i].idx].Timestamp = msg.Timestamp
+					}
+					break
+				}
+			}
+		}
+	}
+	for hIdx, msg := range history {
+		if !matched[hIdx] {
+			dbMessages = append(dbMessages, msg)
+		}
+	}
+	return dbMessages
 }
 
 func normalizedAntigravityPrompt(s string) string {
 	return strings.Join(strings.Fields(s), " ")
+}
+
+func normalizeAntigravityCLIUserMessage(msg *ParsedMessage, history map[string]struct{}) {
+	if msg.Role != RoleUser || msg.IsSystem {
+		return
+	}
+	if _, authored := history[strings.TrimSpace(msg.Content)]; authored {
+		return
+	}
+	msg.Content = extractAntigravityCLIUserRequest(msg.Content)
+	msg.ContentLength = len(msg.Content)
+}
+
+var antigravityCLIUserRequestRegex = regexp.MustCompile(
+	`(?s)^<USER_REQUEST>(.*)</USER_REQUEST>\s*<ADDITIONAL_METADATA>.*?</ADDITIONAL_METADATA>\s*(?:<USER_SETTINGS_CHANGE>.*?</USER_SETTINGS_CHANGE>\s*)?$`,
+)
+
+// extractAntigravityCLIUserRequest recognizes the complete injected metadata tail.
+// Literal tags, incomplete envelopes, and empty requests retain their source text.
+func extractAntigravityCLIUserRequest(s string) string {
+	if match := antigravityCLIUserRequestRegex.FindStringSubmatch(strings.TrimSpace(s)); match != nil {
+		// Remove only the envelope's framing newlines, preserving prompt spacing.
+		request, ok := strings.CutPrefix(match[1], "\r\n")
+		if !ok {
+			request = strings.TrimPrefix(request, "\n")
+		}
+		request, ok = strings.CutSuffix(request, "\r\n")
+		if !ok {
+			request = strings.TrimSuffix(request, "\n")
+		}
+		if strings.TrimSpace(request) != "" {
+			return request
+		}
+	}
+	return s
 }
 
 func nonEmptyAntigravityHistoryMessages(
@@ -571,6 +780,14 @@ func buildAntigravityCLIProjectMap(root string) map[string]string {
 	maps.Copy(out, antigravityProjectMapFromLastConversations(
 		filepath.Join(root, "cache", "last_conversations.json"),
 	))
+	// The cache keeps only each folder's latest conversation and current
+	// history rows carry no conversation ID, so the summary store fills the
+	// conversations they leave unmapped.
+	for id, summary := range loadAntigravitySummaries(context.Background(), root).byID {
+		if _, ok := out[id]; !ok && summary.workspace != "" {
+			out[id] = summary.workspace
+		}
+	}
 	return out
 }
 
@@ -1012,8 +1229,8 @@ func antigravityCompositeHashWithExtra(
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func antigravityCLICompositeHash(path, id, workspace string) (string, error) {
-	return antigravityCompositeHashWithExtra(
+func antigravityCLICompositeHash(ctx context.Context, path, id, workspace string) (string, error) {
+	hash, err := antigravityCompositeHashWithExtra(
 		path,
 		antigravityCLIProviderCompanionPaths(path),
 		func(h interface{ Write([]byte) (int, error) }) error {
@@ -1037,6 +1254,11 @@ func antigravityCLICompositeHash(path, id, workspace string) (string, error) {
 			return err
 		},
 	)
+	if err != nil {
+		return "", err
+	}
+	summaries := loadAntigravitySummaries(ctx, filepath.Dir(filepath.Dir(path)))
+	return antigravityHashWithSummary(hash, summaries.fingerprintDigest(strings.TrimPrefix(id, antigravityImplicitTag))), nil
 }
 
 func antigravityCLIProviderCompanionPaths(path string) []string {
@@ -1572,7 +1794,7 @@ func parseAntigravityCLITrajectory(
 		}
 		// NOTE: We emit a synthetic User message with empty content containing these tool results.
 		// This relies on the sync engine's internal contract (specifically pairToolResults and
-		// pairAndFilter in engine.go) which matches tool results to tool calls by ToolUseID,
+		// pairAndFilter in engine_session_convert.go) which matches tool results to tool calls by ToolUseID,
 		// and then filters out empty-content synthetic User messages from final display.
 		// Future maintainers: do not "clean up" this empty message behavior as it is critical
 		// for correct UI rendering.

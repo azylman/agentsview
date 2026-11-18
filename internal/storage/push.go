@@ -11,9 +11,15 @@ import (
 // PushOptions controls a single replica push. The zero value is an
 // incremental push with generation-wide vector reconciliation.
 type PushOptions struct {
-	// Full bypasses unchanged-fingerprint and unchanged-hash skips so
-	// every session is resent.
+	// Full compares every in-scope session with the replica and removes
+	// replica sessions missing locally. PostgreSQL resends every session;
+	// ClickHouse resends only the sessions whose replica rows differ unless
+	// RewriteUnchanged is also set.
 	Full bool
+	// RewriteUnchanged makes a full ClickHouse push rewrite every session,
+	// including ones whose replica rows already match: the repair an explicit
+	// --full asks for. It has no effect without Full.
+	RewriteUnchanged bool
 	// FullVectors bypasses unchanged-hash skips in the vector phase while
 	// sessions stay incremental.
 	FullVectors bool
@@ -43,6 +49,9 @@ type PushProgress struct {
 	// a full push this covers every local session and can run for minutes),
 	// "" during the session/message push, and "vectors" during the vector
 	// phase, whose progress is carried by the Vector* fields.
+	// PushPhaseWaiting means a daemon push is waiting for another push to
+	// finish, PushPhaseRebuilt that its sync rebuilt the archive, and
+	// PushPhaseWaitingForSync that it is waiting for a local sync to finish.
 	Phase            string
 	SessionsDone     int
 	SessionsTotal    int
@@ -71,13 +80,26 @@ type PushResult struct {
 	// SkippedResumed counts sessions a resumed full push left alone because
 	// the unfinished run it continues already pushed them as they are now.
 	SkippedResumed int
+	// SessionRowsOnly counts pushed sessions whose other replica rows
+	// already held the local content, so the push rewrote only the session
+	// row. SessionsPushed includes them.
+	SessionRowsOnly int
+	// SessionsAppended counts pushed sessions that only grew, so the push
+	// kept the replica rows of their earlier messages and wrote the rest.
+	// SessionsPushed includes them, and MessagesPushed counts only the
+	// messages written.
+	SessionsAppended int
+	// CommitLinksOnly counts sessions whose commit links alone a push
+	// rewrote to bring them to the current format.
+	CommitLinksOnly int
 	// DeletedStale counts replica sessions removed because they no longer
 	// exist locally or left the push scope.
 	DeletedStale int
 	Errors       int
 	Duration     time.Duration
-	// Full reports whether the push rewrote every in-scope session, and
-	// FullReason says why when the caller did not ask for it. A requested
+	// Full reports whether the push ran as a full push (see
+	// PushOptions.Full), and FullReason says why when the caller did not ask
+	// for it. A requested
 	// full push that discarded an unfinished one says so in FullReason.
 	Full       bool
 	FullReason string
@@ -154,3 +176,26 @@ func (r *VectorPushResult) DeferSession(sessionID string) {
 	r.SessionsDeferred++
 	r.DeferredSessionIDs = append(r.DeferredSessionIDs, sessionID)
 }
+
+// PushPhaseWaiting is the progress phase a daemon push reports while it
+// waits for another push to finish. The daemon runs one push at a time.
+const PushPhaseWaiting = "waiting"
+
+// PushNotStartedError marks a push error from before the push recorded a
+// full push it could resume. A watch keeps its --full request after one; any
+// other failed push resumes its recorded full push instead.
+type PushNotStartedError struct{ Err error }
+
+func (e PushNotStartedError) Error() string { return e.Err.Error() }
+func (e PushNotStartedError) Unwrap() error { return e.Err }
+
+// PushPhaseRebuilt is the progress phase a daemon push reports as soon as its
+// sync has rebuilt the archive. Every mirror pushes in full after a rebuild,
+// so a client whose stream ends after this report need not ask for --full
+// again. A client whose stream ends without it keeps its --full request.
+const PushPhaseRebuilt = "rebuilt"
+
+// PushPhaseWaitingForSync is the progress phase a daemon push reports when it
+// has waited a few seconds for a local sync to hand the archive writer back.
+// The push resumes once the sync finishes.
+const PushPhaseWaitingForSync = "waiting_for_sync"

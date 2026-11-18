@@ -1,315 +1,801 @@
 ---
-last_edited: 2026-10-17
+last_edited: 2026-11-16
 title: Changelog
 description: Release history for AgentsView
 ---
 
 The latest release is
-[0.45.0](https://github.com/kenn-io/agentsview/releases/tag/v0.45.0).
+[0.47.0](https://github.com/kenn-io/agentsview/releases/tag/v0.47.0).
 
 ## Unreleased
 
-**Upgrade notes**
-
-- On Windows, stop the daemon before switching back to 0.45.0 or earlier.
-  Older versions can't see a daemon started by this version.
-- The container image now requires a bearer token. Read `auth_token` from
-  `/data/config.toml` or set `AGENTSVIEW_AUTH_TOKEN_FILE` to a mounted token file.
-  The image keeps its defaults when you pass flags:
-  `docker run ghcr.io/kenn-io/agentsview --port 9000` still listens on every
-  interface without opening a browser. The image runs the binary directly;
-  `AGENTSVIEW_MODE=pg-serve` (or the older `PG_SERVE=1`) selects `pg serve`.
-  A PostgreSQL hub can adopt the embedding recipe a workstation pushed, given
-  `AGENTSVIEW_EMBEDDINGS_ENDPOINT`, and `pg push --embed` builds and pushes
-  embeddings in one process. See
-  [container deployment](/docs/configuration/#container-deployment).
-
 **New features**
 
-- Anonymous telemetry now counts empty searches, visible errors in supported
-  workflows, and failed sync attempts. Query and error details stay local. The
-  existing [telemetry opt-out](https://agentsview.io/docs/configuration/#privacy-and-telemetry)
-  applies to these counts.
+- Keep connection secrets in private files instead of environment variables
+  or `config.toml`. Set `token_file` under `[kata]`, `api_key_file` for
+  Docbank, insights, embeddings servers, and recall extraction servers,
+  `token_file` under `[duckdb]`, or `cursor_admin_api_key_file`. A missing or
+  unsafe file is an error that names the setting; AgentsView never falls back
+  to another source. See
+  [Read secrets from files](/docs/configuration/#read-secrets-from-files).
 
-- Combine model variants into one row in Usage and Analytics with
-  `[model_aliases]` in `config.toml`. Scripts, exports, `usage daily`, and MCP
-  keep raw model names.
+- Track token usage and cost for tools that call model APIs directly, with no
+  coding agent in between. Such a tool writes body-free session files to
+  `~/.agentsview/direct-api/`, and AgentsView lists them as **Direct API**
+  sessions. `DIRECT_API_DIR` or `direct_api_dirs` change the directory. See
+  [Direct API Sessions](/docs/token-usage/#direct-api-sessions).
 
-- Anonymous usage reports now distinguish installs waiting for their first
-  session. The server sends `setup_finished` once per installation when the
-  default session list has a session to show, including orphaned sessions and
-  excluding automated sessions and trash. The event follows the existing
-  telemetry opt-out and includes no session details. Existing installs with
-  sessions send it once on their first start after upgrading.
+- A `[custom_model_pricing."<model>"]` entry can set `price_as` to price a model
+  name exactly like a catalog model, such as a private gateway deployment name
+  that serves `gpt-6-sol`. The name inherits that model's long-context tiers
+  and catalog updates, and changing the mapping reprices cached usage. See
+  [Custom Model Pricing](/docs/token-usage/#custom-model-pricing).
 
-- Open session lists now refresh after imports, uploads, and restores.
+- Follow archive changes live from the local daemon with
+  `GET /api/v1/changes/stream`. A sync client or dashboard receives every
+  session and message change as it is published, with token and cost totals
+  and the machine it originated on, and resumes after a disconnect from its
+  last cursor with no gap and no repeat. While a subscriber is connected, the
+  daemon syncs changed session files up to once a second instead of once per
+  `background_sync_interval`. See
+  [Conversation Export](/docs/conversation-export/#follow-changes-live).
 
-- Reporting export version 5 keeps verified repository activity selectable when
-  another session with the same project name has missing or different identity
-  evidence. It replaces version 4, which is no longer available: integrations
-  using version 4 must switch to version 5, obtain new project keys, and refresh
-  saved digests. Version 3 is unchanged.
+- `agentsview export conversations changes --tool-summaries` lists what each
+  session's tools did: calls, errors and measured time by tool category, and
+  the skills the session invoked, without tool names, arguments or results. A
+  saved checkpoint keeps working; the first walk that asks returns every
+  session's summary. See
+  [Session tool summaries](/docs/conversation-export/#session-tool-summaries).
 
-- Browse and search fx sessions, including tool results and child runs. Schema
-  4 sessions sync from `~/.fx/sessions/`, with token costs from the pricing catalog.
-- Assistants connected over MCP can see which tools a session ran, find which
-  sessions edited a file, list a session's sub-agents, read the Activity report,
-  see tool usage and where agents struggled, compare usage between two models or
-  projects, and search the AgentsView guides. The eight new tools are read-only
-  and stay out of the `memory` profile. The server now speaks MCP 2026-07-28
-  over stdio, and clients on older protocol versions keep working.
-- Browse and search Muse Code sessions, Meta's terminal coding agent. Each
-  session shows its prompts, replies, reasoning summaries, tool calls, and tool
-  results. Subagent runs appear as child sessions. Usage reports include Muse
-  token counts, priced at Meta's published Muse Spark and Muse Wonder rates.
-  (#2241)
-- Mistral Vibe sessions from the unified session store sync again, including
-  running turns, tool output, subagents, and token usage. Existing Vibe
-  sessions reparse once for corrected tool categories. (#2139)
-- Include single-prompt sessions in MCP `list_sessions` results with
-  `include_one_shot`, matching `search_content`.
-- Browse and search the retained archive during full parser and archive-only
-  preservation rebuilds with a stale warning; archive writes fail with a retryable
-  503. Scoped upgrades and schema repairs finish before serving.
-- Sessions show the pull requests Claude Code linked them to. Find them on the
-  session page, in `session get`, and in session JSON, and filter with
-  `session list --pr owner/repo#123` or the `pr` API parameter. The first sync
-  after upgrading re-reads Claude sessions in place once to pick up existing links.
-- Label sessions by ticket, role, or run type with
-  `agentsview session label <id> ticket=example` or
-  `PATCH /api/v1/sessions/{id}/labels`, then filter with `--label`, the `label`
-  API parameter, the web UI, or the MCP `list_sessions` tool. Labels survive
-  reparses and resyncs. Label and pull request filters also find child and
-  headless sessions, such as orchestrator workers; the web UI shows the tree
-  that contains them. An explicit one-shot exclusion still applies.
-- An orchestrator can record which session launched a worker with
-  `agentsview session parent <worker-id> <manager-id>` or
-  `PUT /api/v1/sessions/{id}/parent`. The worker appears under its launcher in
-  the session tree, and its cost counts toward the launcher's usage. Transcript
-  links take precedence. Labels and parent links can be recorded before a
-  session syncs.
-- Sync Claude.ai chats from the desktop or Chrome Import dialog without
-  downloading an export. Later runs fetch new or changed chats, including branch
-  switches. Run `agentsview chrome setup` once, restart AgentsView if it is
-  running, and load the printed folder in Chrome. AgentsView opens its Chrome
-  connection only after setup. Chrome Sync also works from
-  `agentsview import --type claude-ai --sync` with no AgentsView tab open. See
-  [Claude.ai Sync](https://agentsview.io/docs/chat-import/#sync-claudeai-chats)
-  for setup, branch updates, Trash copies, and failure handling.
-- Antigravity sessions show the conversation title Antigravity saves in
-  `conversation_summaries.db`, and follow renames there, including for
-  conversations whose transcript is gone. Names set in AgentsView still win.
-- Import ChatGPT dot, Codex web, and Codex cloud task chats that live only on
-  OpenAI's servers. Turn it on with `[agents.codex-cloud] enabled = true` in
-  `config.toml`; it uses the ChatGPT login of your local Codex homes. Live
-  capture is opt-in: with `live_tokens = true`, AgentsView connects to a running
-  chat on OpenAI's side to listen in and record its token usage, so its cost
-  appears in usage totals. Connecting to a chat whose turn just ended can make
-  Codex continue the chat, so AgentsView skips chats with an active goal; see
-  the configuration guide for the remaining case. Chats that ran while
-  AgentsView was not listening in show their share of your plan's weekly and
-  five-hour limits instead, and token totals say how many chats were left out
-  for that reason. The endpoints are private and undocumented, so a change on
-  OpenAI's side can stop the import until AgentsView is updated. Enable the
-  source, or at least live capture, on one machine only. Every machine gives a
-  chat the same session ID. A second machine listens in on the same chats, and
-  its copies of them can conflict when synced to PostgreSQL or ClickHouse. See
-  [Codex Cloud](/docs/configuration/#codex-cloud) for what it sends to OpenAI,
-  how listening in can show on OpenAI's side, such as AgentsView appearing as a
-  chat's client, and its limits. `agentsview export sessions` now reports schema
-  version 7, because `model_usage` is `null` for a Codex cloud chat whose token
-  counts are unknown; update consumers that expect an object there.
-  [Artifact folder sync](/docs/artifact-sync/) now carries each Codex cloud
-  chat's plan usage, so the receiving archive shows the same plan shares and the
-  same count of chats left out of usage totals. Upgrade the receiving AgentsView
-  as well. An older version does not import these chats until it is upgraded.
-- See costs for each Hermes cron job in the `hermes-cron` Usage drill-down.
-  Renamed runs and continuations stay together through recorded parent links.
-  Each job shows its latest recorded name in the selected range, including on
-  hosted PostgreSQL archives. Usage-only archives show job IDs because their
-  titles are discarded. AgentsView keeps no copy of the original Hermes and
-  Augure Desktop files, so cron runs stay individual sessions in archive-only
-  databases and when their sources were gone before upgrading, unless they
-  already have a stored job ID. A non-empty source in `state.db` takes precedence
-  over the transcript's platform when grouping runs.
-  The first sync after upgrading rebuilds the archive once to populate groups.
-  Allow for a one-time re-push of every session to PostgreSQL and ClickHouse
-  after upgrading. For DuckDB mirrors, run `agentsview duckdb push --full` once.
-  Upgrade importers to accept manifest v5 exports; older importers hold them.
-- Click a Usage attribution tile or row to narrow totals and charts while
-  every item stays visible in its own color. Double click or select an item
-  and use **Open** to see its groups and sessions. On touch screens, use
-  **Open**. **Clear selection** clears the displayed dimension. Enter and
-  Space select a project, and the Project and Model picker labels show the
-  selected item. Unchecking the selected item in a picker clears the selection.
-  **All projects**, Escape, and Backspace return with current dates, filters,
-  and selection. The Projects picker hides projects.
-  Project and model selections reset on reload; an agent selection is the header
-  Agent filter.
-- Tool Usage shows empty, repeat and recovery rates for each tool. Click a rate
-  to list the sessions behind it and open the message with the matching call.
-  Rates follow the same filters as the rest of the Analytics page. After you
-  upgrade, AgentsView recomputes older sessions in the background, so their
-  rates appear without a resync. Archives that store no tool results show no
-  rates. Hosted deployments must grant the runtime role `UPDATE` on three new
-  `tool_calls` columns before upgrading, or hosted startup fails; see
-  [Hosted Raw Sync](/docs/hosted-raw-sync/#http-control-plane).
-- Turn on the Friction Log with `enabled = true` under `[friction]` to record
-  corrections, tool errors, workarounds, deferrals, repeated patterns,
-  frustration, and interruptions for each session. Findings are stored in
-  SQLite and sent to PostgreSQL mirrors, ready for upcoming digest, API, and UI
-  work. Review is off by default and never runs during sync: the daemon reviews
-  changed sessions in the background after each sync, so sync speed is the
-  same with it on or off. Turning it on reviews existing sessions in the
-  background. The first PostgreSQL push after turning it on reviews every
-  waiting session before it starts and holds sync until it is done. It then
-  sends every session once. Sessions above 2,000 message, tool-call, and
-  result-event rows or 4 MiB of stored text are marked skipped rather than
-  reviewed. Hosted raw sync adds findings to existing sessions through a
-  `pg raw-reparse` rollout. See
-  [Friction Log](/docs/configuration/#friction-log).
-- Sync a machine you reach over SSH without installing AgentsView on it. Add a
-  `[[remote_hosts]]` entry with `transport = "ssh"` and, if it differs from
-  `host`, a `destination` such as `user@devbox.example.com`. AgentsView places a
-  matching copy of itself in the remote's `~/.cache/agentsview/bin` and runs it
-  only while a sync is in progress. Transfers are compressed with zstd and send
-  only changed files after the first sync, which uploads about 50 MB. An
-  unreachable host is skipped like an offline HTTP host. See
-  [SSH Remote Sync](https://agentsview.io/docs/remote-access/#ssh-remote-sync)
-  for setup, the files left on the remote, and limits.
+- With automatic filing on, reopen linked Kata issues when a digest finding
+  shows the pattern returned after the issue was closed as done.
+
+- `agentsview diagnostics append` records failures outside agent sessions in
+  the daily Friction Log, grouping repeated messages with their count.
+
+- Muse Personal sessions can now appear beside your other agents, including
+  tool results and compaction summaries. Muse Personal keeps its transcripts
+  on the machine Meta hosts for your Muse, not on your laptop, so ask your Muse
+  to install and run AgentsView there. See
+  [Muse Personal](/docs/configuration/#muse-personal).
 
 **Improvements**
 
-- Load Usage totals, top sessions and model comparison faster on large archives.
-- The Usage page starts its model comparison together with totals instead of
-  waiting for them. On an archive of 24,000 sessions the page finished in 4.0
-  seconds instead of 5.6. The comparison pickers stay disabled until totals and
-  the first pair arrive. If a date or filter change leaves a compared model or
-  project with no usage, the comparison switches to the two costliest models, or
-  to projects when fewer than two models have usage. API clients can omit both
-  sides of `GET /api/v1/usage/pairwise-comparison` to get the same default pair.
-- Push semantic search vectors to ClickHouse faster. Each write now covers up to
-  500 sessions instead of one. In testing, the vector part of a full push of
-  1,360 sessions took about 2 seconds instead of about 5 minutes.
-- Speed up large ClickHouse pushes by setting `push_batch_size` on a
-  `[clickhouse]` target. Each batch of sessions makes ClickHouse rewrite its
-  session tables, so larger batches mean fewer rewrites, at the cost of more
-  memory during the push. The default stays at 100 sessions.
-- A full push to ClickHouse or PostgreSQL, or a DuckDB mirror rebuild,
-  interrupted by a restart continues where it stopped on the next push instead
-  of starting over. Pushes to all three now send the most recently active
-  sessions first, so a push that stops early has already delivered your newest
-  work. `--full` still starts over from scratch. If another process has the
-  DuckDB mirror open, a manual push rebuilds the mirror. When an earlier rebuild
-  stopped with session errors, that push now continues it instead of starting
-  over.
-- Push summaries say why a ClickHouse or PostgreSQL push ran in full when you
-  did not pass `--full`, and say `discarded an unfinished full push` when
-  `--full` threw away an interrupted one. A DuckDB rebuild reports
-  `discarded an unfinished rebuild` the same way.
-  A summary that reports ownership conflicts now also shows how many sessions
-  were unchanged, already pushed by the interrupted run, or removed.
-- `agentsview prune --agent <name>` removes an agent you no longer use from
-  search and the archive in one pass, including its sessions in trash and their
-  subagent sessions. Like other prunes, it also deletes each session's source
-  file from disk, except shared app databases such as Hermes `state.db`. A
-  parent session stays when a session outside the filters still belongs to it.
-  The prune summary now shows how many matches are in trash.
+- The background daemon does far less work while nobody is looking at the
+  archive. It now syncs changed session files at most once every ten minutes
+  instead of every five seconds. An open web UI still updates within seconds, a
+  change stream within about a second, and a CLI or MCP read first syncs
+  whatever changed. After an idle pause, the first request syncs only the
+  files that changed instead of scanning every session directory. Set
+  `background_sync_interval = "0s"` to keep the old pace. See
+  [Config File](/docs/configuration/#config-file).
+
+- Search and cold Trends visits open faster with DuckDB. After upgrading, run
+  `agentsview replica duckdb push` on the mirror's owning machine to rebuild
+  it before serving it.
+
+- Native PostgreSQL serving starts filling the Usage cache at launch.
+
+- The Usage page opens faster on ClickHouse and DuckDB mirrors. On a
+  production-size archive, the first one-year summary after a serve start took
+  0.83 seconds instead of 1.48 on ClickHouse (1.8x) and 0.49 seconds instead of
+  3.2 on DuckDB (6.5x). Push now stores priced usage sums per session and 15
+  minutes, and Usage reads add them to the few rows they still deduplicate. A
+  repeat ClickHouse request took 0.09 seconds instead of 0.23 (2.4x), because
+  Usage now records the pricing of each usage group in one call. A ClickHouse
+  push that refreshes prepared usage now waits 3.4 to 4.1 seconds for the
+  refresh and spends 3.4 seconds building the sums, and a full DuckDB rebuild
+  takes about 15 seconds longer. The first DuckDB push after upgrading rebuilds
+  the mirror.
+
+- Usage reuses priced work after restarting native PostgreSQL serving and after
+  pushes. When that cache would first need a large rebuild, such as on first
+  use, after a price change, or after new account usage, Usage shows the direct
+  PostgreSQL result and rebuilds the cache in the background. Its disposable
+  cache lives in `<data-dir>/usage-postgres/`. SQLite keeps cached facts from
+  v0.47.0 and subsequent development builds (cache formats 21 through 23).
+  Formats 21 and 22 rebuild daily rollups once; format 23
+  keeps them. Older formats and corrupt or incompatible caches rebuild. A failed
+  copy keeps the old cache for another attempt on the next launch.
+
+- Session exports now mask API keys, tokens, and other detected secrets by
+  default, using the same masked form as search results. This covers the HTML
+  and Markdown session exports, Gist publishing, the raw
+  `agentsview session export` source stream, and
+  `agentsview export conversations message`. Pass `--reveal` on the CLI, or
+  `reveal=true` on an HTTP export from localhost, to get the stored text
+  unchanged. A conversation body with a masked secret reports `redacted: true`,
+  and its offsets count the masked text. See
+  [Secrets in exports](/docs/usage/#secrets-in-exports) and
+  [Conversation Export](/docs/conversation-export/#secrets-are-masked-by-default).
+
+- `agentsview sync` no longer prints a deprecation warning. It stays a supported
+  shortcut for `agentsview source sync` and is listed in root help again.
+
+- ClickHouse pushes write far less after an archive rebuild, a data-version
+  resync, a scope change, or a format upgrade. Those full pushes now rewrite
+  only the sessions that differ from the mirror and still remove sessions that
+  are gone locally. A session whose messages are unchanged rewrites only its
+  session row, and the commit links upgrade rewrites only commit links.
+  The first push after upgrading republishes each session row once.
+  `clickhouse push --full` still rewrites every session, so use it to repair a
+  damaged mirror. Upgrade `clickhouse serve` together with the pushing clients:
+  an older serve hides image text and Activity usage for sessions a newer
+  client rewrote this way.
+
+- ClickHouse pushes upload only the new messages of a session that grew,
+  instead of every message, tool call, and tool result the session has. For a
+  2,000-message session that gained one message, the push uploaded 183 KB
+  instead of 5.0 MB (27x less) and wrote 15 rows instead of 4,015. Pushes
+  therefore take less time, leave the server fewer old row copies to merge, and
+  rarely trigger the compaction that follows a large rewrite. When only the
+  last uploaded message changed, typically because its tool call got its
+  result, the push uploads that message again with the new ones. On a copy of
+  a real archive pushed about once a minute, the pushes uploaded 1.7 MB instead
+  of 4.2 MB (2.5x less) and 78 messages instead of 1,148 (14.7x fewer). A
+  session whose earlier messages changed, such as an edit or a full re-parse,
+  is still rewritten in full. Upgrade `clickhouse serve`
+  and every pushing client together: an older serve fails tool-sequence and
+  file-reference requests for sessions a newer client appended to.
 
 **Bug fixes**
 
-- On Windows, daemon commands no longer make backup and sync tools treat the
-  whole data directory as changed.
-- A ClickHouse server whose data directory is on NFS no longer logs an
-  `UNSUPPORTED_METHOD` error for `EXCHANGE TABLES` on every push. AgentsView
-  checks once after each server start whether the server can swap tables, and
-  reuses that answer until the server restarts.
-- `agentsview prune` no longer deletes the shared `state.db` of Hermes or
-  Augure Desktop. Sessions synced by 0.45.0 or earlier record the bare
-  `state.db` path, and pruning one deleted the whole app database. The prune
-  summary now says how many source files stay in place.
-- A ClickHouse push that restores a wider project scope after a filtered push
-  stopped with session errors now runs a full push, and pushes stay full until
-  one finishes without errors. Sessions the filtered push removed from the
-  mirror come back. Before, the next push was incremental and left those older
-  sessions missing while reporting success.
-- Codex pages from Desktop builds 0.148.0-alpha.15 through 0.154.0-alpha.6.2
-  now join their thread with its title instead of showing as separate untitled
-  sessions. The upgrade rebuilds the archive once and keeps names, stars, pins,
-  trash, and deletions on the right page. ClickHouse mirrors now run a full push
-  whenever the archive's database id changes, so any full rebuild causes one.
-- Hidden tabs release their live connections so new tabs load, and catch up when
-  shown again.
-- Codex rollouts that carry another thread's metadata stay under their own
-  thread. Upgrading runs a one-time full archive rebuild at data version 137.
-  Pins, Recall entries, and export message IDs move from misfiled rows when a
-  fresh parse at the stored source path proves the corrected thread.
-- DeepSeek Harness v4 sessions now appear after sync, with tool results and
-  recorded token usage.
-- ClickHouse usage reports read prepared usage again for a machine whose
-  mirror held a session with no archive id that the machine's archive no
-  longer has. No push removed such a session, and it kept every session of
-  that machine on the slower raw usage reads. The first push from each
-  machine after upgrading removes them.
-- Fill MCP content-search pages with older matches by excluding recent sessions
-  before the limit. Cutoffs preserve their UTC instant across time zones. Older
-  daemons keep the previous guard after pagination and can return short pages.
-  Default MCP continuations must echo the returned `activity_cutoff` with the
-  numeric cursor; restart searches begun before upgrading.
-- Keep both Cursor conversations when S3 objects in different projects share
-  a session ID. A one-time archive rebuild recovers overwritten Cursor S3
-  conversations while preserving archived sessions and stars.
-- Retry a required archive rebuild automatically when it fails at startup. The
-  daemon keeps serving the existing archive, retries after an hour, and backs
-  off to once a day. Before, the rebuild waited for a restart or a manual
-  resync.
-- Re-importing an unchanged archive with usage-only storage no longer re-reads
-  every titled Codex thread. Usage-only storage discards session titles, so the
-  empty stored title always differed from the thread's title in
-  `session_index.jsonl`, and each import parsed those threads again.
-- Codex, TraeX, and Augure Code sessions show the git branch they started on,
-  so branch filters and project identity include them. Before, every such
-  session had an empty branch. Existing sessions gain their branch on the
-  first sync after upgrading. Sessions started outside a repository or on a
-  detached HEAD, and sessions whose source files are gone, keep an empty
-  branch.
-- Large Claude Code and iCodeMate CLI tool output stays in the archive after
-  the side file holding it is deleted, which happens after Claude Code's
-  cleanup period (30 days by default). Before, a later full re-parse or
-  rebuild replaced the output with the provider's short placeholder. Output
-  replaced before upgrading is not restored.
+- `agentsview source cursor sync-usage` no longer aborts when Cursor rate-limits
+  it. Cursor allows 60 requests per minute per team, so a sync that needed more
+  than about 60 pages, or one that ran while other tools used the same team's
+  admin keys, could fail with `429 Too Many Requests` and store nothing. The
+  command now spaces requests a second apart and retries a page that gets a 429
+  or a server error, waiting as long as Cursor's `Retry-After` asks or backing
+  off when it does not say, and reports each wait on stderr. See
+  [`source cursor sync-usage`](/docs/commands/#agentsview-source-cursor-sync-usage).
+- A growing Codex session no longer leaves a removed copy of every earlier
+  message in the conversation export index each time it is fully re-read. A
+  long session could add millions of such rows and many gigabytes to the
+  archive. Messages before the first changed one now keep their export IDs
+  and stay out of the change stream. The daemon now removes deleted-message
+  records once they are a week or two old, so the rows already there stop
+  taking space without any action. Run `agentsview db compact` to remove them
+  all at once and shrink the database file. Change-stream and
+  conversation-export readers whose position predates a removed record
+  restart with a full replay.
+- AgentsView starts again on x86-64 CPUs without AVX2, BMI2, and FMA (older
+  than x86-64-v3), such as Ivy Bridge, Atom, Pentium Silver, and virtual
+  machines that hide those features. 0.47.0 crashed at startup on these CPUs
+  with an illegal instruction, even when the DuckDB mirror was never used,
+  because the DuckDB 2.0 libraries it linked require x86-64-v3.
+- Sessions from worktrees named `<repo>.<branch>` next to the main checkout,
+  the default worktrunk layout, now group under the repository's project when
+  the checkout is not on disk, such as on a central collector. Before, each
+  worktree folder became its own project. Existing sessions pick up the new name
+  when they are next re-parsed.
+- OpenCode, Kilo, and MiMo Code costs now include reasoning tokens. Current
+  versions of these tools record reasoning separately from output, and
+  AgentsView priced only the output, so sessions on reasoning models were
+  under-billed by the whole reasoning share. Output now counts reasoning once
+  for both new and older recordings, and existing sessions are reparsed in
+  place on upgrade.
+- A busy daemon no longer logs `a long-running reader is holding the WAL`, or
+  a goroutine dump, when its reads only overlap. The warning now appears only
+  when three checkpoints in a row stop at the same point, which means one read
+  stayed open across all of them.
+- AgentsView Desktop on Windows can install in-app updates again. Since 0.43.0
+  the update download is Deflate-compressed, which the app could not unpack, so
+  it restarted on the old version and left an empty
+  `%TEMP%\AgentsView-<version>-updater-*` folder. Copies on an earlier version
+  can still fail this way. If an update does not install, quit AgentsView and
+  run the release's `AgentsView_<version>_x64-setup.exe`.
+- In managed Caddy mode, the proxy no longer writes the auth token into the
+  daemon log when a client passes it as `?token=` on a live-update stream and
+  the request fails. The server also compares bearer tokens in constant time,
+  as the MCP endpoint already did. See
+  [SSE Endpoints](/docs/remote-access/#sse-endpoints).
+- On macOS, live sessions keep updating after FSEvents drops events. A drop now
+  rescans only the session folder that lost events and keeps its native watch,
+  instead of moving every folder onto the 2-minute poll. When folders do need
+  polling, the poll waits at least as long as its last pass took, and watcher
+  syncs run between providers instead of queueing behind the whole pass.
+- Semantic search builds on Kit's built-in local embeddings server no longer
+  fail on every attempt with `embed request failed`. The built-in server runs
+  the model on the CPU, so it now defaults to 8 inputs per request, one request
+  at a time, and a 5-minute request timeout. A request that still times out is
+  retried as two smaller requests, and the error now says the request timed
+  out. Set `batch_size`, `concurrency`, or `timeout` on a `local = true` server
+  to tune it.
+- Codex sessions now show the model's readable reasoning summaries as
+  thinking blocks and mark each context compaction with a divider holding its
+  summary. Encrypted reasoning still shows nothing. When a model response
+  produced only reasoning, its tokens and cost now count. Two model calls with
+  identical token counts can no longer collapse into one. Codex and Codex Cloud
+  compaction dividers no longer say "Context compacted" twice when there is no
+  summary. The next sync reparses Codex, TraeX, Augure Code, Open Interpreter,
+  and Codex Cloud sessions in place.
+- Prune removes matching parent and child session chains in one pass, even
+  without `--agent`.
+- Commit lookups keep live prompts and other archives' deleted-session links.
+- Junie session titles, projects, and working directories refresh during scoped
+  reconciliation even when an index-change notification was missed. Metadata
+  changes for other sessions remain pending for their next index event.
+- An inaccessible subtree no longer makes shared JSONL discovery repeatedly
+  process healthy sibling sessions when the provider supports scoped traversal.
+  Retries remain limited to unfinished paths, and archived sessions under a
+  broken symlink remain available until discovery can establish their source
+  state.
+- Antigravity app and IDE sessions now show their project and working directory
+  instead of all landing in one unlabeled project. AgentsView reads each
+  conversation's workspace folder from Antigravity's
+  `conversation_summaries.db`. Antigravity CLI sessions use it too, so an older
+  conversation in a folder keeps its project after a newer one starts there.
+- Antigravity sub-agent conversations, such as a research agent the main
+  conversation starts, now nest under that conversation. Existing Antigravity
+  sessions pick up both changes on the next sync, without a resync.
+- A full resync no longer drops the project identity of a session that gained a
+  working directory since the previous archive was written.
+- Usage → Projects labels sessions without a project as "Unassigned project"
+  instead of drawing an unnamed slice.
+- Claude sessions recorded through the Claude Agent SDK and other embedding
+  hosts no longer double-count tokens and cost when a tool result splits one
+  model response across several transcript records. These transcripts omit
+  `requestId`, so AgentsView now treats the response's message ID alone as its
+  identity. Web searches spread across such a response are now all billed.
+  After the upgrade, the SQLite usage cache rebuilds once and the next sync
+  reparses Claude, Cowork, Qoder, and iCodeMate sessions in place.
+- Sessions that lost part of their source now say so instead of looking
+  complete. A transcript record larger than 64 MiB, or an OpenCode, Shelley, or
+  Forge database row that does not decode, now counts toward the session's
+  malformed-lines badge and the sync summary's parser anomalies. Any tokens on
+  the lost records are still missing, but the count shows that the totals may
+  be low. Existing sessions pick up the count the next time their source
+  changes; the upgrade does not trigger a resync.
 
-- Codex threads rewound with undo keep every message and every day's usage.
-  Each extra rollout file Codex writes for the undo now shows as its own linked
-  session instead of replacing the thread's transcript. When parent rollout
-  files are available, a subagent started after an undo no longer repeats the
-  thread's earlier turns or counts their tokens again, including when parsed
-  from captured raw files with nested custom session directories.
-  Startup re-reads existing Codex sessions once to restore what was lost,
-  while keeping deleted threads and their undo files hidden or in trash.
-  Permanently deleted threads stay hidden if a missing undo file returns later.
-  Saved names, stars, pinned messages, project identities, and already archived
-  undo files survive this upgrade, even when their source files are gone. Live
-  updates follow the newest undo file even if the original file is gone.
-- A write to one Hermes or Augure Desktop session no longer makes AgentsView
-  reparse and rewrite every session in the same `state.db`. Full sync and
-  file/WAL events now resolve to that one session's source, so an archive
-  with many sessions in one database stops reprocessing all of them on
-  every unrelated write. The first sync after upgrading reparses every Hermes
-  and Augure Desktop session once to record its new per-session source, and a
-  configured PostgreSQL push updates each of them once.
-- Repeated remote imports no longer rewrite unchanged Hermes and Augure Desktop
-  sessions. An HTTP import that downloads a full archive, because the remote
-  host lacks incremental sync or no local mirror is set up, unpacks it into a
-  new temporary folder each time. That folder's location was part of each
-  session's change check, so every such import parsed and stored the same
-  sessions again. The check now uses each file's place inside the Hermes folder.
-  The first sync after upgrading reparses every Hermes and Augure Desktop
-  session once.
+**Upgrade notes**
+
+- Release binaries, installers, wheels, and the published container image no
+  longer include the DuckDB mirror. To keep using `replica duckdb` commands,
+  build from source with `make install DUCKDB=1`. See
+  [Build with DuckDB](/docs/duckdb/#build-with-duckdb).
+
+## 0.47.0
+
+<small>2026-11-09</small>
+
+**Upgrade notes**
+
+- The first local startup builds a new search index before serving requests.
+  Allow about a minute per 2 GB of message text. The index adds about a fifth of
+  the message text size to the archive.
+- PostgreSQL and ClickHouse rewrite stored message text once on their next push,
+  and DuckDB mirrors rebuild on theirs. ClickHouse also reprices its usage once
+  during that push, so Usage reads are slower until it finishes.
+- Sessions from affected agents are reprocessed automatically. Run
+  `agentsview source sync` before using offline reports, so Codex Fast sessions
+  get Fast prices.
+- PostgreSQL archives now keep a change journal. It needs `CREATE` on the schema
+  and `TRIGGER` on the watched tables. Roles without these privileges keep
+  working without it.
+- Commands now live under `source`, `report`, `replica`, and `index`. Older
+  names keep working for at least one release and print their replacements. See
+  the [command migration](/docs/commands/#command-migration).
+- `agentsview serve` in the foreground now exits with status 1 when another
+  server is already running, so service managers retry.
+- Under `AGENTSVIEW_MODE`, a `[vector]` server that reads its key from
+  `AGENTSVIEW_EMBEDDINGS_API_KEY` through `api_key_env` now stops startup.
+  Rename that variable.
+- After upgrading a hosted deployment, schedule retained sources with
+  `agentsview replica pg raw-reparse` under a new run ID to import sources that
+  were too large before.
+
+**New features**
+
+- Review daily problems in the [Friction Log](/docs/quality/#friction-log),
+  including corrections, tool errors, and recurring patterns linked to exact
+  messages. Browse dates, download Markdown, or read findings through the CLI
+  and MCP. Enable it with `[friction] enabled = true`.
+- Turn Friction Log patterns into [Kata](/docs/kata/#file-friction-log-patterns)
+  issues, link existing issues, or remove links from the page or CLI. Enable
+  hourly automatic filing with `[friction.kata] auto_file = true`.
+- Generate an optional model-written Friction Log summary with your configured
+  insights provider. Summaries run only when requested and stay attached to the
+  reviewed digest.
+- Find the recorded session and prompt behind code with
+  [`agentsview why file.go:120-140`](/docs/commands/#agentsview-why) or
+  `agentsview why --commit <sha>`. List a session's recorded commits with
+  `agentsview session commits <id>`.
+- Turn on [search by meaning](/docs/semantic-search/) from Settings or the
+  search palette without editing configuration or restarting. Local
+  installations use an available Ollama server or download the built-in
+  embedding server with progress.
+- Find sessions covering two to five concepts through MCP or the content search
+  API. Results include a supporting passage for each concept.
+- Browse saved Claude and Codex history from
+  [Docbank archives or backup snapshots](/docs/configuration/#history-from-a-saved-archive)
+  alongside local sessions. Imported history remains searchable when the archive
+  is disconnected.
+- Find matching
+  [Docbank file versions](/docs/configuration/#find-transcript-images-in-docbank)
+  beneath retained transcript images and attachments. The optional integration
+  also exposes matches through the API and MCP.
+- Import Open Interpreter sessions with their own label, usage totals, and
+  resume commands. Command Code v3 sessions also import with thinking, tool
+  calls, and token usage.
+- Browse Kiro CLI subagent runs beneath their launching sessions, including
+  nested subagents. The launching transcript shows each delegation's prompt and
+  result.
+- Choose [message colors](/docs/usage/#message-colors) and a Color-blind safe
+  chart palette in Settings > Appearance. Optional message markers, chart
+  patterns, and dashed trend lines distinguish content beyond color alone.
+- Diagnose an expensive session with
+  [`agentsview session diagnose <id>`](/docs/session-api/#agentsview-session-diagnose).
+  The report combines usage, context growth, compactions, large tool results,
+  retry runs, and child-session links.
+- Inspect per-session tokens and costs through MCP `get_session_usage`,
+  including model totals and request breakdowns. Batch CLI lookups use
+  [`agentsview session usage-batch <id>...`](/docs/session-api/#agentsview-session-usage-batch).
+- Import xAI billing CSV files with
+  [`agentsview usage grok <csv>`](/docs/token-usage/#xai-account-usage-csv).
+  Reimports deduplicate billing records, but overlapping local sessions or
+  Cursor billing imports may double count usage.
+- Filter hosted sessions, searches, analytics, and usage by contributing source
+  devices. Sessions supplied by several selected devices count once.
+- Run PostgreSQL serving and watched local ingestion together with
+  `agentsview replica pg serve --push-watch`. Add `--embed` to build and publish
+  embeddings in the same process.
+- Export visible dialogue with
+  [`--text-mode visible`](/docs/conversation-export/#export-classified-dialogue),
+  omitting structured tool and reasoning content. Reporting exports support
+  [hourly snapshots by originating machine](/docs/reporting-export/#report-an-archive-that-contains-several-machines)
+  with `--schema-version 5 --by-machine`.
+- Discover commands from a task description with
+  [`agentsview cli search`](/docs/commands/#find-a-command-by-task). Inspect
+  supported agents, session folders, and captured details with
+  [`agentsview source list`](/docs/commands/#agentsview-source-list), without a
+  daemon or archive.
+- Retry failed hosted parse jobs after fixing their cause with
+  `agentsview replica pg raw-reparse --repair`.
+- Run PostgreSQL and ClickHouse push services beside your own collector with
+  `service install --no-start-daemon`.
+- Pass the embeddings API key to containers through
+  `AGENTSVIEW_EMBEDDINGS_API_KEY`.
+
+**Improvements**
+
+- Usage loads faster on large archives. In separate 30,000-session benchmarks,
+  repeat visits drop from about 24 seconds to under a second on PostgreSQL and
+  DuckDB.
+- Activity, Signals, Trends, and session statistics load faster through reduced
+  reads and reuse of unchanged results. ClickHouse session navigation also stays
+  responsive while dashboard queries run.
+- Session lists and long transcripts open and scroll with fewer stalls. Sidebar
+  rows appear before their titles finish loading, and code highlighting blocks
+  the page less.
+- Sidebar and content searches return sooner, including substring, regex, and
+  multi-term searches.
+- Archives take less space. Message text is stored once when its search text is
+  identical. On a test archive with 1.05 million messages, the messages table
+  shrank from 3.0 GiB to 2.0 GiB.
+- Imports, archive rebuilds, and live Claude and Codex updates finish sooner.
+  PostgreSQL pushes preserve unchanged transcript sections, DuckDB rebuilds
+  write faster, and S3 sync reuses shared Codex parent downloads.
+- Usage charts refresh automatically while visible and catch up when you return.
+  Hidden tabs cancel pending Usage queries instead of holding browser
+  connections.
+- Usage charts omit zero-value tooltip rows and group positive series below 0.5%
+  into Other. Token Attribution adds Linear, Sqrt, and Log choices for treemap
+  label sizes.
+- Activity timelines merge narrow bars into readable time intervals on smaller
+  screens while preserving totals and selection accuracy.
+- Read Claude hook-command output in collapsible cards controlled by the Hooks
+  filter. Hook text is searchable and appears in HTML and Markdown exports.
+- See recorded reasoning effort on Pi-family and Posit Assistant messages.
+- Failed commands include specific recovery hints and structured JSON
+  diagnostics where supported.
+- Reduce background work while idle or on battery. Local sync pauses after ten
+  idle minutes and resumes on archive access; scheduled embedding builds, Recall
+  model passes, and archive audits wait for AC power. Set `sync_interval` to
+  adjust watcher-triggered sync frequency.
+- Keep using AgentsView while Claude.ai Sync runs by closing its dialog; only
+  Stop cancels the run within the page. Closing or reloading the page still ends
+  Sync. An
+  [organization allowlist](/docs/chat-import/#choose-which-organizations-sync-imports)
+  also limits future imports after a restart.
+- Recover useful search results when search by meaning is unavailable. Hybrid
+  CLI and MCP searches return keyword matches with an explanation, and empty
+  searches report matches hidden by session filters.
+- Check stalled PostgreSQL and ClickHouse push watchers with status
+  `--max-stale`. Status reports failed, overdue, or unfinished pushes with a
+  nonzero exit code.
+- See what each watcher-triggered sync read and why sessions were held for retry
+  in `debug.log`.
+- Homebrew builds tell you to run `brew upgrade agentsview` instead of replacing
+  themselves.
+
+**Bug fixes**
+
+- Usage totals include blank Claude thinking responses, unfinished Copilot CLI
+  sessions, and Hermes or Augure Desktop background model calls.
+- Codex Fast-tier sessions use Fast rate estimates. ClickHouse and DuckDB use
+  the latest Copilot-reported session cost.
+- VS Code Copilot and Positron replies keep updating as they grow, preserve pins
+  and notes through rebuilds and pushes, and render without duplicate-tool-call
+  failures.
+- DeepSeek Harness sessions import when logs contain job lifecycle events or
+  compressed frames without checksums.
+- Claude channel and peer messages remain visible and searchable. Slash commands
+  containing `<` in their arguments no longer disappear or leave answers beneath
+  the wrong prompt.
+- Codex forks link to their source sessions. Pi subagent runs and OMP parent
+  links also receive the correct relationships.
+- Archive rebuilds complete despite unavailable Codex fork parents while
+  preserving saved child history. The Sync button performs required rebuilds and
+  reports failures.
+- Remote and temporary worktree sessions reuse established repository project
+  names when recorded repository evidence supports the match. Explicit
+  assignments and mapping rules retain priority.
+- All-history Usage opens during startup price refreshes without internal
+  errors. Concurrent Usage requests in a new time zone avoid database-lock
+  failures.
+- Analytics panels remain usable when another panel fails. Failed panels show
+  their own error and Retry control, and old filter results no longer appear
+  current.
+- Activity's Sessions table keeps its selected sort order and column widths
+  after syncs.
+- Desktop windows reconnect after daemon exits or endpoint changes, accept
+  localhost and IPv6 loopback endpoints, and avoid reloads caused by archive
+  contention. The Linux AppImage also starts on affected Wayland systems.
+- Explicitly started daemons stay running until stopped. Daemon restart also
+  completes in Linux containers whose exited children remain unreaped.
+- Claude and Codex Cloud transcripts show generated images inline with full-size
+  viewing. Codex code-mode `wait` calls show their returned output, and Codex
+  Cloud tool calls no longer appear twice.
+- Hosted search and session browsing remain consistent during incoming uploads
+  and publication. Empty source files upload successfully, and permanent upload
+  rejections stop retrying indefinitely.
+- Background skill discovery avoids protected macOS folders by default. Live
+  watches recover after macOS session folders are recreated, and large Linux
+  archives retain watches beyond 8,192 folders.
+- Transcript-only archives stop reporting retries based solely on repeated tool
+  names. Session links using an unambiguous raw UUID also open correctly.
+- PostgreSQL `fts` searches honor `AND`, `OR`, `NOT`, and parentheses in quoted
+  queries.
 
 **Acknowledgements**
 
-- [@iainlane](https://github.com/iainlane) for the Hermes per-session sync fix.
+- [@rodboev](https://github.com/rodboev) for finding the prompt behind code,
+  search by meaning setup, idle and battery behavior, faster Usage and Activity,
+  and sync, daemon, and Copilot fixes.
+- [@cpcloud](https://github.com/cpcloud) for the faster search index, smaller
+  archives, ClickHouse and Activity performance, generated images in
+  transcripts, and viewer fixes.
+- [@mariusvniekerk](https://github.com/mariusvniekerk) for Open Interpreter
+  support, message colors and the color-blind palette, multi-concept search,
+  `get_session_usage`, xAI billing import, stalled-push checks, and Codex fork
+  fixes.
+- [@salmonumbrella](https://github.com/salmonumbrella) for Friction Log digests,
+  Docbank file lookup, `session diagnose`, grouped commands and recovery hints,
+  `cli search`, and combined PostgreSQL serving and ingestion.
+- [@wesm](https://github.com/wesm) for the Friction Log page, CLI, and Kata
+  filing, Docbank archive browsing, classified dialogue and by-machine exports,
+  and reproducible documentation screenshots.
+- [@reidliu41](https://github.com/reidliu41) for desktop reconnection and
+  startup fixes and shell completion docs.
+- [@vzd3v](https://github.com/vzd3v) for source-device filters and consistent
+  hosted reads.
+- [@tpn](https://github.com/tpn) for faster Usage cache fills and PostgreSQL
+  pushes.
+- [@andrew05060414](https://github.com/andrew05060414) for DeepSeek Harness
+  imports, PostgreSQL `fts` query handling, and keeping tests off wildcard
+  listeners.
+- [@gadenbuie](https://github.com/gadenbuie) for reasoning effort on Pi and
+  Posit Assistant messages.
+- [@Michal-Fularz](https://github.com/Michal-Fularz) for Command Code v3
+  sessions.
+- [@hskiba](https://github.com/hskiba) for Kiro CLI subagent sessions.
+- [@Eldorado-ling](https://github.com/Eldorado-ling) for Claude hook output
+  cards.
+- [@Devehab](https://github.com/Devehab) for treemap label sizing.
+- [@Zaehyeon2](https://github.com/Zaehyeon2) for the Claude.ai organization
+  allowlist.
+- [@zerone0x](https://github.com/zerone0x) for sharing S3 Codex parent
+  downloads.
+- [@wxxb789](https://github.com/wxxb789) for faster DuckDB writes.
+- [@gezerui888](https://github.com/gezerui888) for preserving peer messages.
+- [@nachocab](https://github.com/nachocab) for slash commands containing `<`.
+- [@biggestbinary](https://github.com/biggestbinary) for Copilot usage receipts.
+- [@chikei](https://github.com/chikei) for OMP subagent parent links.
+- [@ianpittwood](https://github.com/ianpittwood) for pi-subagents relationships.
+- [@orshih6](https://github.com/orshih6) for DeepSeek Harness job events.
+- [@mvanhorn](https://github.com/mvanhorn) for the Linux AppImage Wayland fix.
+- [@MaxFreedomPollard](https://github.com/MaxFreedomPollard) for accurate search
+  counts in tool summaries.
+- [@macollins27](https://github.com/macollins27) for the portable docs build.
+
+## 0.46.1
+
+<small>2026-10-22</small>
+
+**Improvements**
+
+- Antigravity CLI sessions show plaintext transcripts with model and token usage
+  attached to the matching model replies.
+
+**Bug fixes**
+
+- Antigravity sessions parse again on read-only mounts, including read-only
+  Docker volumes.
+- Archived Antigravity CLI replies stay intact when the session database cannot
+  be read.
+- Repeated prompts remain separate turns in Antigravity CLI sessions. Existing
+  archives are reprocessed to recover missing turns.
+- Docker builds no longer fail because a required Claude.ai Chrome extension
+  file is missing.
+
+**Contributors**
+
+Thanks to [@azylman](https://github.com/azylman) for the Antigravity fixes in
+[#2337](https://github.com/kenn-io/agentsview/pull/2337), and
+[@wesm](https://github.com/wesm) for the container build fix in
+[#2404](https://github.com/kenn-io/agentsview/pull/2404).
+
+## 0.46.0
+
+<small>2026-10-22</small>
+
+**Upgrade notes**
+
+- The first startup rebuilds affected archives to preserve Codex undo history
+  and repair session identities. Existing history remains browsable with a
+  stale-data warning during full rebuilds; changes pause until the replacement
+  is ready. Allow time for the rebuild and subsequent mirror pushes. See
+  [archive upgrades](/docs/configuration/#database).
+- PostgreSQL, ClickHouse, and DuckDB mirrors need refreshed dialogue search
+  data. Hosted deployments must apply the new runtime grants before upgrading.
+  Follow [message search](/docs/session-api/#agentsview-session-search) and
+  [hosted provisioning](/docs/hosted-raw-sync/#provision-a-hosted-instance).
+- Containers now require a bearer token. Set `auth_token` in `/data/config.toml`
+  or mount a token file with `AGENTSVIEW_AUTH_TOKEN_FILE`. See
+  [container deployment](/docs/configuration/#container-deployment).
+- Reporting schema 3 remains the default. Schema 5 replaces the unreleased
+  schema 4; integrations adopting it must fetch new project keys and refresh
+  saved digests. See [reporting exports](/docs/reporting-export/).
+- Session summary exports now use schema 7. Consumers must accept
+  `model_usage: null` when Codex cloud token counts are unknown. Upgrade
+  [artifact folder sync](/docs/artifact-sync/) importers as well.
+- Hermes cron grouping can require a one-time full mirror transfer. Run
+  `agentsview duckdb push --full` once for an existing DuckDB mirror. Older
+  cron sessions whose original sources are gone remain individual sessions
+  unless they already have a stored job ID.
+- Restart MCP content searches begun before upgrading; use the new
+  continuation's `activity_cutoff` with its cursor.
+- On Windows, stop the daemon before downgrading to 0.45.x or earlier.
+
+**New features**
+
+- Sync Claude.ai chats through Chrome, including Google sign-in. Run
+  `agentsview chrome setup`, load the printed extension folder at
+  `chrome://extensions`, and restart AgentsView before using Import >
+  Claude.ai.
+
+- Import ChatGPT dot, Codex web, and Codex cloud task chats as searchable
+  sessions with the opt-in `codex-cloud` source. Chats without token counts
+  show OpenAI's plan usage figures. Configure this source on one machine only.
+
+- Record Codex cloud token usage with optional `live_tokens = true`. Capture
+  covers only turns heard live, and connecting can send queued messages.
+  Sessions with incomplete capture show a "partly captured" note.
+
+- Preserve a retired computer's Claude and Codex history with `archive capture`
+  and `archive import --seed`, including stars, pins, names, and original
+  files. Archive commands also extract originals and verify backups. Use a
+  separate data directory for new local sessions.
+
+- Sync remote Linux and macOS machines over SSH without manually installing
+  AgentsView or running a remote daemon. Set `transport = "ssh"` in the remote
+  host configuration. SSH authentication must work without a prompt.
+
+- Browse and search Muse Code sessions, including tool output, child sessions,
+  token usage, and costs.
+
+- Browse and search fx schema 4 sessions with tool output and child sessions.
+  Costs appear when an older fx version saved usage data.
+
+- Find sessions by label, linked pull request, or launcher. Claude Code pull
+  request links appear on session pages and in CLI, API, and MCP results.
+  Linked workers contribute to their launcher's total cost.
+
+- Group model variants in Usage with `[model_aliases]` in `config.toml`. Each
+  variant retains its own pricing before totals combine. Restart AgentsView
+  after editing the groups.
+
+- Narrow Usage totals and charts by selecting an item in the cost breakdown
+  panel. Open `hermes-cron` to compare individual jobs, with renamed jobs and
+  continued runs grouped together.
+
+- Analyze a session's tool effectiveness from its actions menu. Reports mark
+  conclusions as helped, did not help, or unclear and link each conclusion to
+  the calls it cites.
+
+- Compare empty-result, repeat-call, and recovery rates in Tool Usage under
+  project and date filters. Click a nonzero rate to inspect contributing
+  sessions and calls.
+
+- Ask connected assistants about file edits, tool calls, child sessions,
+  Activity reports, tool usage, and cost comparisons through eight new
+  read-only MCP tools. Built-in guide search works offline. `list_sessions`
+  also accepts `include_one_shot: true` for single-prompt sessions.
+
+- Remove an agent's archived history with `agentsview prune --agent <name>`. The
+  filter combines with project and date filters and includes matching sessions
+  in Trash. Prune also deletes matched source files, except shared app-owned
+  stores.
+
+- Sort Activity reports by Session or Model across pages. Cleanup, worktree
+  mapping, and session health tables also support sorting by their data
+  columns.
+
+- Build and push embeddings in one process with `pg push --embed`. Containers
+  accept deployment and embedding settings directly through environment
+  variables, and the container image now requires a bearer token.
+
+- Sign native HTTP reader and raw-sync requests with an independent HMAC key. A
+  separate machine listener enforces signatures, existing authentication, and
+  reader or contributor grants.
+
+- Export repository-scoped activity and usage with reporting schema 5. Known
+  repositories remain selectable when other sessions share their project name.
+  Integrations adopting schema 5 must fetch new project keys and refresh saved
+  digests. Schema 3 remains the default.
+
+- Record corrections, tool errors, workarounds, and repeated patterns with the
+  opt-in [Friction Log](/docs/configuration/#friction-log). Background review
+  stores findings for later reporting; it is off by default.
+
+**Improvements**
+
+- Browse and search the existing archive while a full rebuild runs. Results
+  carry a stale-data warning, and changes pause until the replacement is
+  ready. Failed startup rebuilds retry automatically.
+- Keep new local sessions arriving in the archive and UI while a PostgreSQL,
+  ClickHouse, or DuckDB push runs.
+- Resume interrupted full PostgreSQL and ClickHouse pushes and DuckDB rebuilds.
+  Recent sessions transfer first, and summaries show resumed progress and why
+  a full transfer runs. Passing `--full` discards unfinished progress and
+  starts over.
+- Load Usage and Activity faster on large archives. The daemon prepares daily
+  usage totals after sync, and the Usage page starts its model comparison
+  alongside totals.
+- Keep quick page reads responsive while slow SQLite analytics run. Large
+  session trees also load faster instead of remaining at "0 SESSIONS" or
+  "LOADING".
+- Keep semantic indexing up with long-running sessions by re-embedding only the
+  newest portion of an assistant run. The first build after upgrading
+  re-embeds oversized runs once.
+- Transfer less data during HTTP remote sync by leaving unchanged transcripts
+  out of downloads. Updated peers use Zstandard compression, and combined
+  rebuilds prepare several remote hosts at once.
+- Push ClickHouse embeddings in batches to reduce transfer time. Large archives
+  also support a configurable `push_batch_size` for session transfers, with
+  higher values using more memory.
+- Sync only changed Hermes and Augure Desktop sessions instead of rewriting
+  every session in their shared database. Unchanged remote imports also avoid
+  repeated parsing after a one-time refresh.
+- Show Antigravity IDE and local Qoder sessions by their app-saved titles,
+  including existing sessions. Names set in AgentsView take precedence. Qoder
+  renames appear at the next sync.
+- Show the recorded starting branch for Codex, TraeX, and Augure Code sessions.
+  Recorded repository identity also survives a missing checkout or changed
+  remote.
+- Use provider-reported billed costs for gptme messages when available,
+  including zero. Estimate-only messages retain catalog pricing, and
+  provider-routed model names resolve catalog prices.
+- Return stored session usage without waiting for full startup ingestion.
+  Targeted refresh failures retain those totals with a warning.
+- Reuse MCP daemon connections to reduce repeated discovery delays.
+- Refresh open session lists after imports, uploads, and restores.
+
+**Bug fixes**
+
+- Preserve Codex undo history and daily usage as linked continuations instead of
+  letting rollout files replace one another. Older Desktop undo files also
+  link back to their thread. The upgrade rebuilds existing archives and
+  preserves supported saved annotations.
+- Keep Codex rollouts under their own thread when a file contains another
+  thread's metadata, preventing one transcript from replacing another.
+- Read older Codex rollouts after Codex compresses them to `.jsonl.zst`.
+  Decoding failures leave archived messages intact.
+- Import current Mistral Vibe sessions from its unified store, including running
+  turns, tool output, child sessions, and token usage.
+- Import DeepSeek Harness v4 and newer TraeX transcripts with their messages,
+  tools, and usage. OpenClaw databases with compressed events also sync
+  without blocking healthy sessions.
+- Preserve both Cursor conversations when S3 imports contain the same session ID
+  in different projects.
+- Keep archived Claude and iCodeMate CLI tool output after Claude Code deletes
+  its external tool-result files.
+- Preserve Hermes and Augure Desktop's shared app database when pruning
+  sessions. Dry-run and deletion summaries report source files left in place.
+- Keep message jumps in view while nearby rows finish rendering. Background tabs
+  also release browser connections so new session tabs no longer hang at
+  "Loading messages...".
+- Limit SQLite message matches and snippets to conversation text after reparse.
+  Use `--in messages` for dialogue and `--in thinking` for reasoning. Ordinary
+  session search still includes the full transcript.
+- Fill MCP content-search pages with eligible older matches instead of excluding
+  active sessions after applying the limit. Restart searches begun before
+  upgrading.
+- Accept displayed machine names in filters across the web UI, CLI, API, and
+  MCP. Unknown or ambiguous names return an explanatory error.
+- Allow chart palette and zoom changes on read-only servers without editing
+  configuration files by hand.
+- Keep archive commands working when unrelated configuration sections are
+  invalid. SSH remote sync also ignores server-only configuration errors.
+- Stop repeated Antigravity and Gemini imports caused only by SQLite bookkeeping
+  changes. Recovered file watchers also stop rescanning the entire Claude
+  folder.
+- Avoid rewriting unchanged PostgreSQL messages and usage events during
+  metadata-only pushes. Shared PostgreSQL mirrors also stop reporting other
+  machines' unrelated vector sessions as conflicts.
+- Prepare ClickHouse usage totals on filesystems that cannot exchange tables,
+  including NFS. Unsupported-exchange errors appear once per server start
+  instead of on every push.
+- Produce stable reporting digests when several checkouts or worktrees share a
+  repository.
+- Wait through concurrent daemon restarts and preserve host daemon discovery
+  across process namespaces. Auto-starting commands report a held archive lock
+  instead of launching a server that cannot open it.
+- Keep Windows daemon commands from marking the entire data directory as changed
+  for backup and sync tools. Stop the daemon before downgrading to 0.45.x or
+  earlier.
+- Honor `DO_NOT_TRACK=1` and suppress telemetry in CI and non-release builds.
+  Browser telemetry also waits for the selected server's response before
+  sending further reports.
+- Reject compromised eMudhra/emSign certificate chains in HTTPS connections and
+  desktop updates. Linux and Windows desktop builds also update their bundled
+  trust roots.
+
+**Acknowledgements**
+
+- [@rodboev](https://github.com/rodboev) for Chrome Sync, fx support,
+  tool-effectiveness reports and rates, model aliases, Hermes cron costs,
+  faster reports, and archive and telemetry fixes.
+- [@cpcloud](https://github.com/cpcloud) for Codex cloud chats and live token
+  capture, resumable mirror pushes, continued local sync during pushes, and
+  ClickHouse transfer improvements.
+- [@wesm](https://github.com/wesm) for local archive capture and recovery, SSH
+  sync, Codex undo history, reporting repository identity, faster HTTP
+  transfers, and daemon fixes.
+- [@mariusvniekerk](https://github.com/mariusvniekerk) for Muse Code support,
+  session labels and pull-request links, launcher relationships, stable
+  reporting digests, and display settings on read-only servers.
+- [@salmonumbrella](https://github.com/salmonumbrella) for the expanded MCP
+  tools, native HTTP request signing, container deployment settings, Friction
+  Log processing, and dialogue-only message search.
+- [@suatkocar](https://github.com/suatkocar) for stable message jumps, releasing
+  hidden-tab connections, and faster session trees.
+- [@NicholasLea](https://github.com/NicholasLea) for Antigravity and Qoder
+  session titles.
+- [@EwenQuim](https://github.com/EwenQuim) for Mistral Vibe unified-store
+  support.
+- [@TimeToBuildBob](https://github.com/TimeToBuildBob) for gptme billed costs
+  and provider-routed model pricing.
+- [@godlockin](https://github.com/godlockin) for preserving shared app databases
+  during pruning and configuration lock handling.
+- [@iainlane](https://github.com/iainlane) for the Hermes per-session sync work
+  and avoiding PostgreSQL usage rewrites caused by timestamp formatting.
+- [@amahpour](https://github.com/amahpour) for excluding other machines' vector
+  sessions from PostgreSQL conflict counts.
+- [@macollins27](https://github.com/macollins27) for compressed Codex rollout
+  support.
+- [@hx-dl](https://github.com/hx-dl) for current TraeX transcript and
+  token-usage support.
+- [@rudycelekli](https://github.com/rudycelekli) for compressed OpenClaw
+  transcript events.
+- [@laugustyniak](https://github.com/laugustyniak) for recorded Codex starting
+  branches.
+- [@patrickzzz](https://github.com/patrickzzz) for single-prompt sessions in MCP
+  list results.
+- [@pascalwhoop](https://github.com/pascalwhoop) for Claude.ai usage counts
+  after shorter branch imports.
+- [@Uddoo](https://github.com/Uddoo) for avoiding Antigravity remote imports
+  triggered by WAL index changes.
 
 ## 0.45.0
 

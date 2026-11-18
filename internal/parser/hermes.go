@@ -61,6 +61,7 @@ type hermesStateSession struct {
 	title            string
 	cronJob          string
 	apiCallCount     int
+	modelUsage       []hermesModelUsage
 }
 
 type hermesStateMessage struct {
@@ -387,6 +388,7 @@ func parseHermesJSONLSession(path, project, machine string) (*ParsedSession, []P
 	}
 
 	sess := &ParsedSession{
+		MalformedLines:             lr.SkippedLines(),
 		ID:                         fullID,
 		Project:                    project,
 		projectSynthesizedByHermes: projectSynthesized,
@@ -772,7 +774,18 @@ func readHermesStateSessions(ctx context.Context,
 		ss.endedAt = hermesUnixTime(ended)
 		out = append(out, ss)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	usage, err := readHermesModelUsage(ctx, conn, "")
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		out[i].modelUsage = usage[out[i].id]
+	}
+	return out, nil
 }
 
 func readHermesStateMessages(ctx context.Context,
@@ -813,8 +826,7 @@ func readHermesStateMessages(ctx context.Context,
 	return out, rows.Err()
 }
 
-const hermesStateSessionQuery = `
-	SELECT id, source, COALESCE(model, ''),
+const hermesStateSessionColumns = `id, source, COALESCE(model, ''),
 		COALESCE(parent_session_id, ''), started_at,
 		COALESCE(ended_at, 0), COALESCE(message_count, 0),
 		COALESCE(input_tokens, 0), COALESCE(output_tokens, 0),
@@ -823,7 +835,9 @@ const hermesStateSessionQuery = `
 		COALESCE(reasoning_tokens, 0),
 		estimated_cost_usd, actual_cost_usd,
 		COALESCE(cost_status, ''), COALESCE(cost_source, ''),
-		COALESCE(title, ''), COALESCE(api_call_count, 0)
+		COALESCE(title, ''), COALESCE(api_call_count, 0)`
+
+const hermesStateSessionQuery = `SELECT ` + hermesStateSessionColumns + `
 	FROM sessions
 	WHERE id = ?`
 
@@ -880,6 +894,11 @@ func readHermesStateSession(ctx context.Context,
 			"query hermes session %s: %w", rawSessionID, err,
 		)
 	}
+	usage, err := readHermesModelUsage(ctx, conn, rawSessionID)
+	if err != nil {
+		return hermesStateSession{}, false, err
+	}
+	ss.modelUsage = usage[rawSessionID]
 	return ss, true, nil
 }
 
@@ -1007,9 +1026,14 @@ func readHermesStateSessionSourceConn(ctx context.Context,
 // real Parse path still makes the authoritative richer-source choice when
 // a session is actually reparsed.
 func readHermesStateSessionFingerprintInputs(ctx context.Context,
-	conn *sql.DB, stateDB, rawSessionID string,
+	conn *sql.DB, stateDB, rawSessionID string, usage []hermesModelUsage,
 ) (hermesStateSession, []hermesStateMessage, []string, error) {
-	ss, found, err := readHermesStateSession(ctx, conn, rawSessionID)
+	ss, err := scanHermesStateSession(conn.QueryRowContext(ctx, hermesStateSessionQuery, rawSessionID))
+	found := !errors.Is(err, sql.ErrNoRows)
+	if !found {
+		err = nil
+	}
+	ss.modelUsage = usage
 	if err != nil {
 		return hermesStateSession{}, nil, nil, hermesStateLookupError{err: err}
 	}
@@ -1242,7 +1266,7 @@ func hermesHasCostSource(costSource string) bool {
 	return costSource != "" && costSource != "none"
 }
 
-func hermesUsageEvents(
+func hermesSummaryUsageEvents(
 	ss hermesStateSession, sessionID string,
 ) []ParsedUsageEvent {
 	if ss.model == "" {

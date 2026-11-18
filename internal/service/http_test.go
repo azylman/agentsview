@@ -16,6 +16,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/kit/stacktest"
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
@@ -165,6 +166,7 @@ func requireWatchEvent(
 			}
 			return ev
 		case <-deadline:
+			stacktest.Dump(t)
 			require.FailNowf(t, "test failed", "did not receive %q event within %s", event, timeout)
 		}
 	}
@@ -184,6 +186,7 @@ func requireChannelClosed[T any](
 				return
 			}
 		case <-deadline:
+			stacktest.Dump(t)
 			require.FailNowf(t, "test failed", "channel not closed within %s", timeout)
 		}
 	}
@@ -1171,7 +1174,7 @@ func TestHTTPSearchContent_501PreservesBackendSpecificReason(t *testing.T) {
 			name: "PostgreSQL vector disabled",
 			body: "semantic search not available: semantic search: PostgreSQL " +
 				"requires [vector] enabled with a matching [vector.embeddings] " +
-				"config and a generation pushed by 'agentsview pg push'",
+				"config and a generation pushed by 'agentsview replica pg push'",
 		},
 	}
 	for _, tt := range tests {
@@ -1195,7 +1198,7 @@ func TestHTTPSearchContent_501PreservesBackendSpecificReason(t *testing.T) {
 			require.Error(t, err)
 			require.ErrorIs(t, err, service.ErrSemanticUnavailable)
 			assert.Equal(t, tt.body, err.Error())
-			assert.NotContains(t, err.Error(), "agentsview embeddings build")
+			assert.NotContains(t, err.Error(), "agentsview index embeddings build")
 		})
 	}
 }
@@ -1356,4 +1359,86 @@ func TestHTTPWatchGeneratedClientPreservesTransport(t *testing.T) {
 	case <-ctx.Done():
 		require.FailNow(t, "watch did not deliver its event")
 	}
+}
+
+func TestHTTPBackendRecallTimeBoundsAndCursor(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/version" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"api_version":21}`))
+			return
+		}
+		assert.Equal(t, "2026-01-01T00:00:00Z", r.URL.Query().Get("updated_since"))
+		assert.Equal(t, "2025-12-01T00:00:00Z", r.URL.Query().Get("created_since"))
+		assert.Equal(t, "previous", r.URL.Query().Get("cursor"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"entries":[{"id":"archived","status":"archived"}],"trusted_only":false,"next_cursor":"next"}`))
+	}))
+	t.Cleanup(srv.Close)
+	svc := servicehttp.NewHTTPBackend(srv.URL, "", false, "")
+	list, err := svc.ListRecallEntries(t.Context(), service.RecallFilter{UpdatedSince: "2026-01-01T00:00:00Z", CreatedSince: "2025-12-01T00:00:00Z", Cursor: "previous"})
+	require.NoError(t, err)
+	assert.Equal(t, "next", list.NextCursor)
+	require.Len(t, list.RecallEntries, 1)
+	assert.Equal(t, "archived", list.RecallEntries[0].Status)
+}
+
+func TestHTTPBackendRecallTimeBoundsOldServer(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		known  bool
+		filter service.RecallFilter
+	}{
+		{"known", true, service.RecallFilter{UpdatedSince: "2026-01-01T00:00:00Z"}},
+		{"probed", false, service.RecallFilter{CreatedSince: "2026-01-01T00:00:00Z"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if r.URL.Path == "/api/v1/version" {
+					_, _ = w.Write([]byte(`{"api_version":20}`))
+					return
+				}
+				calls++
+				if calls == 1 {
+					assert.Empty(t, r.URL.Query().Get("cursor"))
+					_, _ = w.Write([]byte(`{"entries":[],"trusted_only":false,"next_cursor":"previous"}`))
+					return
+				}
+				assert.Equal(t, "previous", r.URL.Query().Get("cursor"))
+				_, _ = w.Write([]byte(`{"entries":[{"id":"second-page"}],"trusted_only":false,"next_cursor":""}`))
+			}))
+			t.Cleanup(srv.Close)
+			svc := servicehttp.NewHTTPBackend(srv.URL, "", false, "")
+			if tc.known {
+				svc = servicehttp.NewHTTPBackendForServer(srv.URL, "", servicehttp.HTTPServerCapabilities{APIVersion: 20})
+			}
+			_, err := svc.ListRecallEntries(t.Context(), tc.filter)
+			require.ErrorContains(t, err, "restart or upgrade")
+			assert.Zero(t, calls)
+			if tc.known {
+				first, err := svc.ListRecallEntries(t.Context(), service.RecallFilter{})
+				require.NoError(t, err)
+				second, err := svc.ListRecallEntries(t.Context(), service.RecallFilter{Cursor: first.NextCursor})
+				require.NoError(t, err)
+				require.Len(t, second.RecallEntries, 1)
+				assert.Equal(t, "second-page", second.RecallEntries[0].ID)
+				assert.Equal(t, 2, calls)
+			}
+		})
+	}
+}
+
+func TestHTTPBackendRecallStalePageReturnsRestartError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "previous", r.URL.Query().Get("cursor"))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"recall corpus changed during pagination"}`))
+	}))
+	t.Cleanup(srv.Close)
+	svc := servicehttp.NewHTTPBackendForServer(srv.URL, "", servicehttp.HTTPServerCapabilities{APIVersion: 21})
+	_, err := svc.ListRecallEntries(t.Context(), service.RecallFilter{UpdatedSince: "2026-01-01T00:00:00Z", Cursor: "previous"})
+	require.ErrorIs(t, err, service.ErrStaleRecallPagination)
 }

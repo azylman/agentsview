@@ -156,23 +156,35 @@ func (c *pushAliasRoutingConn) QueryContext(
 ) (driver.Rows, error) {
 	normalized := strings.ToLower(query)
 	switch {
-	case strings.Contains(normalized, "agentsview_json_integer"):
+	case strings.Contains(normalized, "select version()"):
 		return &pushAliasRoutingRows{
-			columns: []string{
-				"output", "web_search", "malformed",
-				"malformed_scoped_output", "malformed_scoped_web_search",
-			},
-			values: [][]driver.Value{{"42", "2", "7", "42", "2"}},
+			columns: []string{"version"},
+			values:  [][]driver.Value{{"PostgreSQL 18"}},
 		}, nil
 	case strings.Contains(normalized, "select coalesce(max(data_version), 0) from sessions"):
 		return &pushAliasRoutingRows{
 			columns: []string{"coalesce"},
 			values:  [][]driver.Value{{0}},
 		}, nil
+	case strings.Contains(normalized, "select exists(select 1 from sync_metadata"),
+		strings.Contains(normalized, "select exists (select 1 from sync_metadata"):
+		return &pushAliasRoutingRows{
+			columns: []string{"exists"},
+			values:  [][]driver.Value{{false}},
+		}, nil
 	case strings.Contains(normalized, "from information_schema.tables"):
 		return &pushAliasRoutingRows{
 			columns: []string{"exists"},
 			values:  [][]driver.Value{{1}},
+		}, nil
+	case strings.Contains(normalized, "select table_name, column_name, data_type"):
+		return &pushAliasRoutingRows{
+			columns: []string{"table_name", "column_name", "data_type"},
+		}, nil
+	case strings.Contains(normalized, "from information_schema.columns"):
+		return &pushAliasRoutingRows{
+			columns: []string{"wide"},
+			values:  [][]driver.Value{{true}},
 		}, nil
 	case strings.Contains(normalized, "from pg_indexes"):
 		return &pushAliasRoutingRows{
@@ -315,16 +327,16 @@ func TestSessionAliasBackfillForcesOneFullPush(t *testing.T) {
 func TestTranscriptRevisionBackfillForcesOneFullPush(t *testing.T) {
 	store := &syncStateStoreStub{}
 
-	full, needed, err := applyTranscriptRevisionBackfillRequirement(
-		t.Context(), store, false,
+	full, needed, err := applyBackfillRequirement(
+		t.Context(), store, transcriptRevisionBackfillStateKey, false,
 	)
 	require.NoError(t, err)
 	assert.True(t, full)
 	assert.True(t, needed)
 
-	require.NoError(t, markTranscriptRevisionBackfillDone(t.Context(), store))
-	full, needed, err = applyTranscriptRevisionBackfillRequirement(
-		t.Context(), store, false,
+	require.NoError(t, markBackfillDone(t.Context(), store, transcriptRevisionBackfillStateKey))
+	full, needed, err = applyBackfillRequirement(
+		t.Context(), store, transcriptRevisionBackfillStateKey, false,
 	)
 	require.NoError(t, err)
 	assert.False(t, full)
@@ -1846,75 +1858,4 @@ func TestNilStrSanitizes(t *testing.T) {
 	// should return nil.
 	nul := "\x00"
 	assert.Nil(t, nilStr(&nul), "nilStr(\"\\x00\") should be nil")
-}
-
-func TestShouldSkipSessionMessagesInBatchedPush(t *testing.T) {
-	const sessionID = "sess-batched"
-	baseComparisons := &pushMessageComparison{
-		MessageAggregates: map[string]pushMessageAggregate{
-			sessionID: {Count: 2, Sum: 12, Max: 6, Min: 1},
-		},
-		MessageContentHash: map[string]string{
-			sessionID: "abc",
-		},
-		MessageRoleTime: map[string]string{
-			sessionID: "role-time",
-		},
-		MessageFlags: map[string]string{
-			sessionID: "flags",
-		},
-		MessageSystemOrdinals: map[string]string{
-			sessionID: "0,1",
-		},
-		MessageTokenFingerprint: map[string]string{
-			sessionID: "tokens",
-		},
-		ToolCallAggregates: map[string]pushToolCallAggregate{
-			sessionID: {Count: 1, Sum: 99},
-		},
-		ToolCallFingerprint: map[string]string{
-			sessionID: "toolcalls",
-		},
-		ToolResultFingerprint: map[string]string{
-			sessionID: "results",
-		},
-		UsageEventFingerprint: map[string]string{
-			sessionID: "usage",
-		},
-	}
-	unchangedFP := pushLocalMessageFingerprint{
-		Sum:           12,
-		Max:           6,
-		Min:           1,
-		ContentHashFP: "abc",
-		RoleTimeFP:    "role-time",
-		FlagsFP:       "flags",
-		SystemFP:      "0,1",
-		ToolCallCount: 1,
-		ToolCallSum:   99,
-		ToolCallFP:    "toolcalls",
-		ToolResultFP:  "results",
-		TokenFP:       "tokens",
-		UsageEventFP:  "usage",
-	}
-
-	assert.True(t, shouldSkipSessionMessages(
-		sessionID, 2, unchangedFP, false, baseComparisons,
-	), "unchanged sessions should be skipped as unchanged")
-
-	changedFP := unchangedFP
-	changedFP.ToolCallSum = 100
-	assert.False(t, shouldSkipSessionMessages(
-		sessionID, 2, changedFP, false, baseComparisons,
-	), "tool-call sum mismatch should force push")
-
-	changedFP = unchangedFP
-	changedFP.ToolResultFP = "changed-results"
-	assert.False(t, shouldSkipSessionMessages(
-		sessionID, 2, changedFP, false, baseComparisons,
-	), "tool-result event mismatch should force push")
-
-	assert.False(t, shouldSkipSessionMessages(
-		sessionID, 2, unchangedFP, true, baseComparisons,
-	), "full mode should not skip by fingerprint check")
 }

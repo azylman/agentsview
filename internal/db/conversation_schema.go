@@ -17,7 +17,7 @@ CREATE TRIGGER IF NOT EXISTS conversation_messages_revision AFTER INSERT ON conv
 WHEN NEW.revision = 0
 BEGIN
  INSERT INTO archive_metadata(key,value) VALUES ('conversation_publication_revision','1')
- ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT);
+ ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1;
  UPDATE conversation_messages SET revision=(SELECT CAST(value AS INTEGER) FROM archive_metadata WHERE key='conversation_publication_revision')
  WHERE session_id=NEW.session_id AND message_id=NEW.message_id;
 END;
@@ -30,14 +30,14 @@ WHEN OLD.ordinal IS NOT NEW.ordinal OR OLD.role IS NOT NEW.role OR OLD.timestamp
  OR OLD.removed IS NOT NEW.removed
 BEGIN
  INSERT INTO archive_metadata(key,value) VALUES ('conversation_publication_revision','1')
- ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT);
+ ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1;
  UPDATE conversation_messages SET revision=(SELECT CAST(value AS INTEGER) FROM archive_metadata WHERE key='conversation_publication_revision')
  WHERE session_id=NEW.session_id AND message_id=NEW.message_id;
 END;
 CREATE TRIGGER IF NOT EXISTS conversation_session_delete AFTER DELETE ON sessions
 BEGIN
  UPDATE conversation_messages SET deleted=1,removed=1,body=NULL WHERE session_id=OLD.id AND removed=0;
- INSERT INTO archive_metadata(key,value) VALUES ('conversation_publication_revision','1') ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT);
+ INSERT INTO archive_metadata(key,value) VALUES ('conversation_publication_revision','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1;
  INSERT INTO conversation_session_changes(session_id,revision,deleted) SELECT OLD.id,CAST(value AS INTEGER),1 FROM archive_metadata WHERE key='conversation_publication_revision'
  ON CONFLICT(session_id) DO UPDATE SET revision=excluded.revision,deleted=1;
 END;
@@ -45,21 +45,21 @@ CREATE TRIGGER IF NOT EXISTS conversation_session_trash AFTER UPDATE OF deleted_
 WHEN OLD.deleted_at IS NOT NEW.deleted_at
 BEGIN
  UPDATE conversation_messages SET deleted=(NEW.deleted_at IS NOT NULL) WHERE session_id=NEW.id AND removed=0;
- INSERT INTO archive_metadata(key,value) VALUES ('conversation_publication_revision','1') ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT);
+ INSERT INTO archive_metadata(key,value) VALUES ('conversation_publication_revision','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1;
  INSERT INTO conversation_session_changes(session_id,revision,deleted) SELECT NEW.id,CAST(value AS INTEGER),(NEW.deleted_at IS NOT NULL) FROM archive_metadata WHERE key='conversation_publication_revision'
  ON CONFLICT(session_id) DO UPDATE SET revision=excluded.revision,deleted=excluded.deleted;
 END;
 CREATE TRIGGER IF NOT EXISTS conversation_session_project AFTER UPDATE OF project,machine ON sessions
 WHEN (OLD.project IS NOT NEW.project OR OLD.machine IS NOT NEW.machine) AND (EXISTS(SELECT 1 FROM conversation_messages WHERE session_id=NEW.id AND removed=0) OR EXISTS(SELECT 1 FROM conversation_session_changes WHERE session_id=NEW.id))
 BEGIN
- INSERT INTO archive_metadata(key,value) VALUES ('conversation_publication_revision','1') ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT);
+ INSERT INTO archive_metadata(key,value) VALUES ('conversation_publication_revision','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1;
  INSERT INTO conversation_session_changes(session_id,revision,deleted) SELECT NEW.id,CAST(value AS INTEGER),(NEW.deleted_at IS NOT NULL) FROM archive_metadata WHERE key='conversation_publication_revision'
  ON CONFLICT(session_id) DO UPDATE SET revision=excluded.revision,deleted=excluded.deleted;
 END;
 CREATE TRIGGER IF NOT EXISTS conversation_project_insert AFTER INSERT ON session_project_identity_snapshots
 WHEN EXISTS(SELECT 1 FROM conversation_messages WHERE session_id=NEW.session_id AND removed=0) OR EXISTS(SELECT 1 FROM conversation_session_changes WHERE session_id=NEW.session_id)
 BEGIN
- INSERT INTO archive_metadata(key,value) VALUES ('conversation_publication_revision','1') ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT);
+ INSERT INTO archive_metadata(key,value) VALUES ('conversation_publication_revision','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1;
  INSERT INTO conversation_session_changes(session_id,revision,deleted) SELECT NEW.session_id,CAST(value AS INTEGER),COALESCE((SELECT deleted_at IS NOT NULL FROM sessions WHERE id=NEW.session_id),1) FROM archive_metadata WHERE key='conversation_publication_revision'
  ON CONFLICT(session_id) DO UPDATE SET revision=excluded.revision,deleted=excluded.deleted;
 END;
@@ -71,14 +71,14 @@ WHEN (OLD.project IS NOT NEW.project OR OLD.machine IS NOT NEW.machine OR OLD.ro
  OR OLD.checkout_state IS NOT NEW.checkout_state OR OLD.git_branch IS NOT NEW.git_branch
  OR OLD.remote_resolution IS NOT NEW.remote_resolution) AND (EXISTS(SELECT 1 FROM conversation_messages WHERE session_id=NEW.session_id AND removed=0) OR EXISTS(SELECT 1 FROM conversation_session_changes WHERE session_id=NEW.session_id))
 BEGIN
- INSERT INTO archive_metadata(key,value) VALUES ('conversation_publication_revision','1') ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT);
+ INSERT INTO archive_metadata(key,value) VALUES ('conversation_publication_revision','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1;
  INSERT INTO conversation_session_changes(session_id,revision,deleted) SELECT NEW.session_id,CAST(value AS INTEGER),COALESCE((SELECT deleted_at IS NOT NULL FROM sessions WHERE id=NEW.session_id),1) FROM archive_metadata WHERE key='conversation_publication_revision'
  ON CONFLICT(session_id) DO UPDATE SET revision=excluded.revision,deleted=excluded.deleted;
 END;
 CREATE TRIGGER IF NOT EXISTS conversation_project_delete AFTER DELETE ON session_project_identity_snapshots
 WHEN EXISTS(SELECT 1 FROM conversation_messages WHERE session_id=OLD.session_id AND removed=0) OR EXISTS(SELECT 1 FROM conversation_session_changes WHERE session_id=OLD.session_id)
 BEGIN
- INSERT INTO archive_metadata(key,value) VALUES ('conversation_publication_revision','1') ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT);
+ INSERT INTO archive_metadata(key,value) VALUES ('conversation_publication_revision','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1;
  INSERT INTO conversation_session_changes(session_id,revision,deleted) SELECT OLD.session_id,CAST(value AS INTEGER),COALESCE((SELECT deleted_at IS NOT NULL FROM sessions WHERE id=OLD.session_id),1) FROM archive_metadata WHERE key='conversation_publication_revision'
  ON CONFLICT(session_id) DO UPDATE SET revision=excluded.revision,deleted=excluded.deleted;
 END;`
@@ -92,6 +92,15 @@ func ensureConversationSchemaLocked(ctx context.Context, w *writerHandle) error 
 	if _, err := tx.ExecContext(ctx, conversationSchemaSQL); err != nil {
 		return fmt.Errorf("creating conversation export state: %w", err)
 	}
+	if err := ensureConversationVisibleSchema(ctx, tx); err != nil {
+		return err
+	}
+	if err := ensureConversationUsageSchema(ctx, tx); err != nil {
+		return err
+	}
+	if err := ensureConversationToolSchema(ctx, tx); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -102,6 +111,14 @@ const conversationExportInitializedKey = "conversation_export_initialized"
 func conversationExportActiveTx(tx transactionQueries) (bool, error) {
 	var active bool
 	err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM archive_metadata WHERE key=?)`, conversationExportInitializedKey).Scan(&active)
+	return active, err
+}
+
+// ConversationExportActive reports whether the archive maintains its
+// conversation index, without taking the writer.
+func (db *DB) ConversationExportActive(ctx context.Context) (bool, error) {
+	var active bool
+	err := db.getReader().QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM archive_metadata WHERE key=?)`, conversationExportInitializedKey).Scan(&active)
 	return active, err
 }
 
@@ -156,6 +173,9 @@ func initializeConversationExportTx(ctx context.Context, tx *sql.Tx, usageOnly b
 			return err
 		}
 	}
+	if err := journalConversationToolSessionsTx(ctx, tx); err != nil {
+		return err
+	}
 	_, err := tx.ExecContext(ctx, `INSERT INTO archive_metadata(key,value) VALUES (?,'1')`, conversationExportInitializedKey)
 	return err
 }
@@ -163,14 +183,14 @@ func initializeConversationExportTx(ctx context.Context, tx *sql.Tx, usageOnly b
 // A session written under usage policy keeps its gap until a full rewrite,
 // even when the projection is rebuilt from text that is present again.
 func applyConversationPolicyGapsTx(ctx context.Context, tx *sql.Tx, where string) error {
-	_, err := tx.ExecContext(ctx, `UPDATE conversation_messages SET body=NULL,digest='',text_bytes=0,gap='archive_content_excluded'
+	_, err := tx.ExecContext(ctx, `UPDATE conversation_messages SET body=NULL,digest='',text_bytes=0,gap='archive_content_excluded',visible_digest='',visible_text_bytes=0,visible_gap='archive_content_excluded'
 	 WHERE removed=0 AND session_id IN (SELECT session_id FROM conversation_session_changes WHERE gap='archive_content_excluded') AND `+where)
 	return err
 }
 
 const conversationCopyColumns = `session_id,message_id,ordinal,role,timestamp,source_id,digest,text_bytes,gap,deleted,removed`
 
-const refreshConversationMessagesSQL = `SELECT m.session_id,m.ordinal,m.role,m.content,COALESCE(m.timestamp,''),m.source_uuid,
+const refreshConversationMessagesSQL = `SELECT m.session_id,m.ordinal,m.role,m.content,` + sqliteDialogueExprM + `,COALESCE(m.timestamp,''),m.source_uuid,
 	 COALESCE(c.message_id,lower(hex(randomblob(16)))),COALESCE(c.gap,''),COUNT(*) OVER (PARTITION BY m.session_id,m.source_uuid)
 	 FROM (SELECT * FROM messages WHERE role IN ('user','assistant') AND is_system=0 AND source_subtype!='tool_result' AND %s) m
 	 LEFT JOIN conversation_messages c ON c.session_id=m.session_id AND c.ordinal=m.ordinal AND c.removed=0
@@ -197,7 +217,7 @@ func refreshConversationMessagesFromArchiveTx(ctx context.Context, tx *sql.Tx, w
 		var msg Message
 		var id, gap string
 		var sourceCount int
-		if err := rows.Scan(&msg.SessionID, &msg.Ordinal, &msg.Role, &msg.Content, &msg.Timestamp, &msg.SourceUUID, &id, &gap, &sourceCount); err != nil {
+		if err := rows.Scan(&msg.SessionID, &msg.Ordinal, &msg.Role, &msg.Content, &msg.DialogueText, &msg.Timestamp, &msg.SourceUUID, &id, &gap, &sourceCount); err != nil {
 			return err
 		}
 		if msg.SessionID != session || len(pending) == conversationRowsPerStmt {
@@ -251,7 +271,7 @@ func copyConversationRowsTx(ctx context.Context, tx *sql.Tx, where, sessionID st
 		}
 		return nil
 	}
-	_, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO main.conversation_messages (`+conversationCopyColumns+`) SELECT `+sessionID+strings.TrimPrefix(conversationCopyColumns, "session_id")+` FROM old_db.conversation_messages WHERE `+where)
+	_, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO main.conversation_messages (`+conversationCopyColumns+conversationVisibleCopyColumns+`) SELECT `+sessionID+strings.TrimPrefix(conversationCopySelect(ctx, tx), "session_id")+` FROM old_db.conversation_messages WHERE `+where)
 	if err != nil {
 		return err
 	}
@@ -305,7 +325,7 @@ func copyConversationSessionStatesTx(ctx context.Context, tx *sql.Tx, where, ses
 // projection rows, reading text from the archived message at the same ordinal.
 func conversationMessagesTx(ctx context.Context, tx *sql.Tx, sessionID string) ([]Message, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT c.ordinal,c.role,c.timestamp,c.source_id,
-	 CASE WHEN c.digest='' THEN '' ELSE COALESCE(m.content,'') END
+	 CASE WHEN c.digest='' THEN '' ELSE COALESCE(m.content,'') END,`+sqliteDialogueExprM+`
 	 FROM main.conversation_messages c LEFT JOIN main.messages m ON m.session_id=c.session_id AND m.ordinal=c.ordinal
 	 WHERE c.session_id=? AND c.removed=0 ORDER BY c.ordinal`, sessionID)
 	if err != nil {
@@ -315,7 +335,7 @@ func conversationMessagesTx(ctx context.Context, tx *sql.Tx, sessionID string) (
 	var msgs []Message
 	for rows.Next() {
 		msg := Message{SessionID: sessionID}
-		if err := rows.Scan(&msg.Ordinal, &msg.Role, &msg.Timestamp, &msg.SourceUUID, &msg.Content); err != nil {
+		if err := rows.Scan(&msg.Ordinal, &msg.Role, &msg.Timestamp, &msg.SourceUUID, &msg.Content, &msg.DialogueText); err != nil {
 			return nil, err
 		}
 		msgs = append(msgs, msg)
@@ -374,7 +394,7 @@ func reconcileConversationResyncTx(ctx context.Context, tx *sql.Tx, usageOnly bo
 		if _, err := tx.ExecContext(ctx, `DELETE FROM main.conversation_messages WHERE session_id=?`, id); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO main.conversation_messages (`+conversationCopyColumns+`) SELECT ?`+strings.TrimPrefix(conversationCopyColumns, "session_id")+` FROM old_db.conversation_messages WHERE session_id=?`, id, mapped.sourceID); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO main.conversation_messages (`+conversationCopyColumns+conversationVisibleCopyColumns+`) SELECT ?`+strings.TrimPrefix(conversationCopySelect(ctx, tx), "session_id")+` FROM old_db.conversation_messages WHERE session_id=?`, id, mapped.sourceID); err != nil {
 			return err
 		}
 		if err := reconcileConversationMessagesTx(tx, id, msgs, true, usageOnly); err != nil {

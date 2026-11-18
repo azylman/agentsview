@@ -1,8 +1,15 @@
 run:
   go: "1.27"
+  # Lint the DuckDB driver that release builds leave out.
   build-tags:
     - fts5
+    - duckdb
 linters:
+  enable:
+    - kennnolint
+    # Catches contexts re-derived from themselves in loops and closures,
+    # which grow an ever-deeper parent chain.
+    - fatcontext
   settings:
     forbidigo:
       forbid:

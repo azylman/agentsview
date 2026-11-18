@@ -20,6 +20,7 @@ const (
 	tokenCoverageRepairMetadataKey        = "token_coverage_repair_v1"
 	sourceCurationBackfillMetadataKey     = "source_curation_baseline_backfill_v1"
 	codexThreadScopeMetadataKey           = "codex_thread_scope_v1"
+	dialogueDedupeMetadataKey             = "dialogue_dedupe_v1"
 	projectIdentityRemoteScrubMetadataKey = "git_remote_credentials_scrub_v1"
 	tokenCoverageBackfillBatchSize        = 1000
 )
@@ -30,95 +31,6 @@ type columnMigration struct {
 	def    string
 	desc   string
 }
-
-// fallback_key remains in the installed signature so CREATE OR REPLACE can
-// upgrade existing databases; extraction is deliberately governed by
-// json_path for both valid and supported malformed values.
-const postgresUsageJSONHelperDDL = `
-CREATE OR REPLACE FUNCTION agentsview_json_integer(
-    raw_value TEXT, json_path TEXT[], fallback_key TEXT
-) RETURNS TEXT
-LANGUAGE PLpgSQL
-IMMUTABLE
-AS $function$
-DECLARE
-    parsed JSONB;
-    counter TEXT;
-    repaired TEXT;
-BEGIN
-    parsed := raw_value::JSONB;
-    counter := parsed #>> json_path;
-    IF counter ~ '^-?[0-9]+$' THEN
-        RETURN counter;
-    END IF;
-    RETURN NULL;
-EXCEPTION WHEN OTHERS THEN
-    BEGIN
-        repaired := raw_value || repeat('}', GREATEST(
-            length(raw_value) - length(replace(raw_value, '{', '')) -
-            (length(raw_value) - length(replace(raw_value, '}', ''))),
-            0));
-        parsed := repaired::JSONB;
-        counter := parsed #>> json_path;
-        IF counter ~ '^-?[0-9]+$' THEN
-            RETURN counter;
-        END IF;
-        RETURN NULL;
-    EXCEPTION WHEN OTHERS THEN
-        RETURN NULL;
-    END;
-END;
-$function$;`
-
-// cockroachUsageJSONHelperDDL avoids PL/pgSQL exception blocks, which older
-// CockroachDB releases reject. json_valid guards the JSONB cast; end-truncated
-// legacy objects are balanced before the exact requested path is extracted.
-const cockroachUsageJSONHelperDDL = `
-CREATE OR REPLACE FUNCTION agentsview_json_integer(
-    raw_value TEXT, json_path TEXT[], fallback_key TEXT
-) RETURNS TEXT
-LANGUAGE SQL
-IMMUTABLE
-AS $function$
-SELECT CASE
-    WHEN json_valid(candidate_value) THEN
-        CASE
-            WHEN (candidate_value::JSONB #>> json_path) ~ '^-?[0-9]+$'
-                THEN candidate_value::JSONB #>> json_path
-            ELSE NULL
-        END
-    ELSE NULL
-END
-FROM (
-    SELECT CASE
-        WHEN json_valid(raw_value) THEN raw_value
-        ELSE raw_value || repeat('}', GREATEST(
-            length(raw_value) - length(replace(raw_value, '{', '')) -
-            (length(raw_value) - length(replace(raw_value, '}', ''))),
-            0))
-        END AS candidate_value
-) repaired
-$function$;`
-
-const usageJSONHelperProbe = `
-SELECT
-    agentsview_json_integer(
-        '{"metadata":{"output_tokens":900},"output_tokens":"42"}',
-        ARRAY['output_tokens'], 'output_tokens'),
-    agentsview_json_integer(
-        '{"metadata":{"web_search_requests":9},"server_tool_use":{"web_search_requests":"2"}}',
-        ARRAY['server_tool_use', 'web_search_requests'],
-        'web_search_requests'),
-    agentsview_json_integer(
-        '{"output_tokens":"7"',
-        ARRAY['output_tokens'], 'output_tokens'),
-    agentsview_json_integer(
-        '{"metadata":{"output_tokens":900},"output_tokens":"42"',
-        ARRAY['output_tokens'], 'output_tokens'),
-    agentsview_json_integer(
-        '{"metadata":{"web_search_requests":9},"server_tool_use":{"web_search_requests":"2"',
-        ARRAY['server_tool_use', 'web_search_requests'],
-        'web_search_requests')`
 
 // sessionPlanUsageDDL mirrors SQLite's session_plan_usage. Times stay
 // the archive's RFC 3339 text and groups its JSON text, so every backend
@@ -144,6 +56,50 @@ CREATE TABLE IF NOT EXISTS session_plan_usage (
     FOREIGN KEY (session_id)
         REFERENCES sessions(id) ON DELETE CASCADE
 );
+`
+
+// pricingMetaDDL holds pricing bookkeeping that is not a price, such as
+// the OpenRouter ownership list.
+const pricingMetaDDL = `
+CREATE TABLE IF NOT EXISTS pricing_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+`
+
+const commitLinksDDL = `
+CREATE TABLE IF NOT EXISTS commit_links (
+    session_id TEXT NOT NULL, sha TEXT NOT NULL,
+    branch TEXT NOT NULL, subject TEXT NOT NULL, repository TEXT NOT NULL,
+    message_ordinal INTEGER NOT NULL, call_index INTEGER NOT NULL, tool_use_id TEXT NOT NULL,
+    committed_at TEXT NOT NULL, turn_ordinal INTEGER, turn_text TEXT NOT NULL,
+    project TEXT NOT NULL, retained BOOLEAN NOT NULL, PRIMARY KEY(session_id,sha)
+);
+CREATE INDEX IF NOT EXISTS idx_commit_links_sha ON commit_links(sha);
+`
+
+// imageTextDDL holds the archive's successful image extractions at portable
+// source coordinates, one row per image and processor.
+const imageTextDDL = `
+CREATE TABLE IF NOT EXISTS image_text (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    source_kind TEXT NOT NULL, message_ordinal INTEGER NOT NULL,
+    call_index INTEGER NOT NULL, event_index INTEGER NOT NULL, image_index INTEGER NOT NULL,
+    image_hash TEXT NOT NULL, processor TEXT NOT NULL, provider TEXT NOT NULL,
+    model TEXT NOT NULL, revision TEXT NOT NULL, text TEXT NOT NULL,
+    PRIMARY KEY(session_id,source_kind,message_ordinal,call_index,event_index,image_index,processor)
+);
+`
+
+const retainedCommitLinksDDL = `
+CREATE TABLE IF NOT EXISTS retained_commit_links (
+    source_archive_id TEXT NOT NULL, session_id TEXT NOT NULL, sha TEXT NOT NULL,
+    branch TEXT NOT NULL, subject TEXT NOT NULL, repository TEXT NOT NULL,
+    message_ordinal INTEGER NOT NULL, call_index INTEGER NOT NULL, tool_use_id TEXT NOT NULL,
+    committed_at TEXT NOT NULL, PRIMARY KEY(source_archive_id,session_id,sha)
+);
+CREATE INDEX IF NOT EXISTS idx_retained_commit_links_session_sha ON retained_commit_links(session_id,sha);
+CREATE INDEX IF NOT EXISTS idx_retained_commit_links_sha ON retained_commit_links(sha);
 `
 
 // coreDDL creates the tables and indexes. It uses unqualified
@@ -241,6 +197,7 @@ CREATE TABLE IF NOT EXISTS messages (
     role           TEXT NOT NULL,
     content        TEXT NOT NULL,
     thinking_text  TEXT NOT NULL DEFAULT '',
+    dialogue_text  TEXT,
     timestamp      TIMESTAMPTZ,
     has_thinking   BOOLEAN NOT NULL DEFAULT FALSE,
     has_tool_use   BOOLEAN NOT NULL DEFAULT FALSE,
@@ -251,6 +208,8 @@ CREATE TABLE IF NOT EXISTS messages (
     token_usage    TEXT NOT NULL DEFAULT '',
     context_tokens INT NOT NULL DEFAULT 0,
     output_tokens  INT NOT NULL DEFAULT 0,
+    usage_output_tokens       BIGINT,
+    usage_web_search_requests BIGINT,
     provider_id    TEXT NOT NULL DEFAULT '',
     has_context_tokens BOOLEAN NOT NULL DEFAULT FALSE,
     has_output_tokens  BOOLEAN NOT NULL DEFAULT FALSE,
@@ -305,16 +264,17 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_session
 
 CREATE INDEX IF NOT EXISTS idx_usage_events_occurred
     ON usage_events (occurred_at);
-` + sessionPlanUsageDDL + `
+` + sessionPlanUsageDDL + sessionUsageTotalsDDL + `
 CREATE TABLE IF NOT EXISTS cursor_usage_events (
     id BIGSERIAL PRIMARY KEY,
+    agent TEXT NOT NULL DEFAULT 'cursor',
     occurred_at TIMESTAMPTZ NOT NULL,
     model TEXT NOT NULL,
     kind TEXT NOT NULL DEFAULT '',
-    input_tokens INT NOT NULL DEFAULT 0,
-    output_tokens INT NOT NULL DEFAULT 0,
-    cache_write_tokens INT NOT NULL DEFAULT 0,
-    cache_read_tokens INT NOT NULL DEFAULT 0,
+    input_tokens BIGINT NOT NULL DEFAULT 0,
+    output_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_write_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_read_tokens BIGINT NOT NULL DEFAULT 0,
     charged_microdollars BIGINT NOT NULL DEFAULT 0,
     cursor_token_fee_microdollars BIGINT NOT NULL DEFAULT 0,
     user_id TEXT NOT NULL DEFAULT '',
@@ -388,7 +348,7 @@ CREATE TABLE IF NOT EXISTS model_pricing (
     cache_creation_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
     cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
     cache_read_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
-    updated_at TEXT NOT NULL DEFAULT ''
+    updated_at TIMESTAMPTZ
 );
 
 CREATE TABLE IF NOT EXISTS model_pricing_bands (
@@ -400,7 +360,7 @@ CREATE TABLE IF NOT EXISTS model_pricing_bands (
     cache_creation_microdollars_per_mtok BIGINT NOT NULL,
     cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
     cache_read_microdollars_per_mtok BIGINT NOT NULL,
-    updated_at TEXT NOT NULL DEFAULT '',
+    updated_at TIMESTAMPTZ,
     PRIMARY KEY (model_pattern, above_input_tokens)
 );
 
@@ -410,9 +370,10 @@ CREATE TABLE IF NOT EXISTS genai_pricing (
     source_ref TEXT NOT NULL DEFAULT '',
     source TEXT NOT NULL,
     data_json BYTEA NOT NULL,
-    updated_at TEXT NOT NULL DEFAULT ''
+    updated_at TIMESTAMPTZ
 );
 
+` + pricingMetaDDL + `
 CREATE TABLE IF NOT EXISTS source_archives (
     source_archive_id   TEXT PRIMARY KEY,
     source_archive_salt TEXT NOT NULL
@@ -608,6 +569,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_result_events_dedup
         call_index, event_index
     );
 
+` + commitLinksDDL + retainedCommitLinksDDL + imageTextDDL + `
+
 CREATE TABLE IF NOT EXISTS secret_findings (
     id               BIGINT GENERATED ALWAYS AS IDENTITY
                          PRIMARY KEY,
@@ -662,7 +625,223 @@ CREATE INDEX IF NOT EXISTS idx_insights_lookup
 CREATE INDEX IF NOT EXISTS idx_insights_cache
     ON insights (cache_key, created_at DESC)
     WHERE cache_key <> '';
+
 `
+
+// frictionReviewDDL adds daily state without altering the shipped findings schema.
+const frictionReviewDDL = `
+CREATE TABLE IF NOT EXISTS diagnostic_events (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    message TEXT NOT NULL,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    occurred_at_exact TEXT NOT NULL,
+    accepted_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_diagnostic_events_occurred ON diagnostic_events (occurred_at);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_friction_activity
+    ON sessions(COALESCE(ended_at, started_at))
+    WHERE deleted_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS friction_digests (
+    date             TEXT PRIMARY KEY,
+    timezone         TEXT NOT NULL,
+    rules_version    TEXT NOT NULL,
+    built_at         TIMESTAMPTZ NOT NULL,
+    revision         INTEGER NOT NULL DEFAULT 1,
+    sessions_scanned INTEGER NOT NULL,
+    snapshot_json    TEXT NOT NULL,
+    summary_json     TEXT NOT NULL,
+    markdown         TEXT NOT NULL,
+    markdown_sha256  TEXT NOT NULL,
+    run_id           TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS friction_digest_sessions (
+    subject_id   TEXT PRIMARY KEY,
+    date         TEXT NOT NULL,
+    subject_kind TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_friction_digest_sessions_date
+    ON friction_digest_sessions (date);
+
+CREATE TABLE IF NOT EXISTS friction_patterns (
+    fingerprint      TEXT PRIMARY KEY,
+    kind             TEXT NOT NULL,
+    title            TEXT NOT NULL,
+    first_seen_date  TEXT NOT NULL,
+    last_seen_date   TEXT NOT NULL,
+    occurrence_count INTEGER NOT NULL,
+    session_count    INTEGER NOT NULL,
+    last_subject_id  TEXT NOT NULL,
+    last_ordinal     INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_friction_patterns_last_seen
+    ON friction_patterns (last_seen_date);
+
+CREATE TABLE IF NOT EXISTS friction_issue_links (
+    fingerprint       TEXT PRIMARY KEY,
+    kata_instance_uid TEXT NOT NULL,
+    kata_project_uid  TEXT NOT NULL,
+    issue_uid         TEXT NOT NULL,
+    qualified_id      TEXT NOT NULL,
+    web_url           TEXT NOT NULL DEFAULT '',
+    source            TEXT NOT NULL,
+    linked_at         TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS friction_filing_state (
+    fingerprint     TEXT PRIMARY KEY,
+    state           TEXT NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    first_failed_at TIMESTAMPTZ,
+    next_attempt_at TIMESTAMPTZ,
+    last_error      TEXT NOT NULL DEFAULT '',
+    updated_at      TIMESTAMPTZ NOT NULL
+);
+`
+
+// movePricingMetaPG moves pricing metadata out of model_pricing. Older
+// pushes kept the OpenRouter ownership list as a model_pricing row whose
+// pattern starts with "_", with the list in updated_at. A key already in
+// pricing_meta was written by a newer push, so it wins. One statement
+// deletes and copies the rows, so a reader never sees both layouts or
+// neither, inside or outside a caller's transaction.
+func movePricingMetaPG(ctx context.Context, conn storeExecutor) error {
+	if _, err := conn.ExecContext(ctx, `
+		WITH moved AS (
+			DELETE FROM model_pricing
+			WHERE model_pattern LIKE '\_%' ESCAPE '\'
+			RETURNING model_pattern, updated_at
+		)
+		INSERT INTO pricing_meta (key, value)
+		SELECT model_pattern, updated_at FROM moved
+		ON CONFLICT (key) DO NOTHING`); err != nil {
+		return fmt.Errorf("moving pg pricing metadata to pricing_meta: %w", err)
+	}
+	return nil
+}
+
+// migratePricingLayoutPG moves pricing metadata into pricing_meta and
+// then types the pricing times, which the metadata kept as text. It first
+// finishes any rename an earlier start left undone, because the move reads
+// model_pricing.updated_at and a start that stopped after dropping the text
+// column leaves only updated_at_typed.
+func migratePricingLayoutPG(ctx context.Context, conn storeExecutor) error {
+	types, err := pricingTimeColumnTypesPG(ctx, conn)
+	if err != nil {
+		return err
+	}
+	if err := finishPricingTimeRenamesPG(ctx, conn, types); err != nil {
+		return err
+	}
+	if err := movePricingMetaPG(ctx, conn); err != nil {
+		return err
+	}
+	return typePricingTimesPG(ctx, conn, types)
+}
+
+// pricingTimeTables are the pricing tables whose updated_at older stores
+// kept as text.
+var pricingTimeTables = []string{
+	"model_pricing", "model_pricing_bands", "genai_pricing",
+}
+
+// typePricingTimesPG converts the pricing tables' updated_at columns from
+// text to timestamptz. Older stores kept them as text because pricing
+// metadata shared model_pricing (see movePricingMetaPG). An empty time
+// becomes NULL. CockroachDB converts a column type only outside a
+// transaction and behind an experimental setting, so each table copies the
+// times into a new column instead. Every step can be repeated, and
+// finishPricingTimeRenamesPG completes the last one, so a run that stops
+// partway finishes on the next start. types holds the column types from
+// pricingTimeColumnTypesPG.
+func typePricingTimesPG(
+	ctx context.Context, conn storeExecutor, types map[string]map[string]string,
+) error {
+	for _, table := range pricingTimeTables {
+		if types[table]["updated_at"] != "text" {
+			continue
+		}
+		for _, statement := range []string{
+			"ALTER TABLE " + table + " ADD COLUMN IF NOT EXISTS updated_at_typed TIMESTAMPTZ",
+			"UPDATE " + table + " SET updated_at_typed = NULLIF(updated_at, '')::timestamptz",
+			"ALTER TABLE " + table + " DROP COLUMN updated_at",
+		} {
+			if _, err := conn.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("typing pg %s.updated_at: %w", table, err)
+			}
+		}
+		if err := renamePricingTimePG(ctx, conn, table); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// finishPricingTimeRenamesPG renames updated_at_typed to updated_at on
+// each pricing table where typePricingTimesPG dropped the text column but
+// stopped before the rename. A renamed table has no text column left, so
+// typePricingTimesPG skips it.
+func finishPricingTimeRenamesPG(
+	ctx context.Context, conn storeExecutor, types map[string]map[string]string,
+) error {
+	for _, table := range pricingTimeTables {
+		columns := types[table]
+		if columns["updated_at"] != "" || columns["updated_at_typed"] == "" {
+			continue
+		}
+		if err := renamePricingTimePG(ctx, conn, table); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func renamePricingTimePG(ctx context.Context, conn storeExecutor, table string) error {
+	if _, err := conn.ExecContext(ctx,
+		"ALTER TABLE "+table+" RENAME COLUMN updated_at_typed TO updated_at",
+	); err != nil {
+		return fmt.Errorf("renaming pg %s.updated_at: %w", table, err)
+	}
+	return nil
+}
+
+// pricingTimeColumnTypesPG returns the data types of the pricing tables'
+// updated_at columns, and of the column typePricingTimesPG copies them
+// into, by table and column.
+func pricingTimeColumnTypesPG(
+	ctx context.Context, conn hostedQuerier,
+) (map[string]map[string]string, error) {
+	rows, err := conn.QueryContext(ctx, `
+		SELECT table_name, column_name, data_type
+		FROM information_schema.columns
+		WHERE table_schema = current_schema()
+		  AND table_name IN ('model_pricing', 'model_pricing_bands', 'genai_pricing')
+		  AND column_name IN ('updated_at', 'updated_at_typed')`)
+	if err != nil {
+		return nil, fmt.Errorf("reading pg pricing column types: %w", err)
+	}
+	defer rows.Close()
+	types := make(map[string]map[string]string)
+	for rows.Next() {
+		var table, column, dataType string
+		if err := rows.Scan(&table, &column, &dataType); err != nil {
+			return nil, fmt.Errorf("scanning pg pricing column types: %w", err)
+		}
+		if types[table] == nil {
+			types[table] = make(map[string]string)
+		}
+		types[table][column] = dataType
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading pg pricing column types: %w", err)
+	}
+	return types, nil
+}
 
 func migrateMoneyColumnsPG(
 	ctx context.Context,
@@ -888,60 +1067,6 @@ func rekeyMigratedCursorUsageEventsPG(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
-func probeUsageJSONHelper(ctx context.Context, db *sql.DB) error {
-	var outputTokens, webSearchRequests, malformedOutput string
-	var malformedScopedOutput, malformedScopedWebSearch string
-	if err := db.QueryRowContext(ctx, usageJSONHelperProbe).Scan(
-		&outputTokens, &webSearchRequests, &malformedOutput,
-		&malformedScopedOutput, &malformedScopedWebSearch,
-	); err != nil {
-		return err
-	}
-	if outputTokens != "42" || webSearchRequests != "2" ||
-		malformedOutput != "7" || malformedScopedOutput != "42" ||
-		malformedScopedWebSearch != "2" {
-		return fmt.Errorf(
-			"unexpected extraction results: output=%q web_search=%q "+
-				"malformed=%q malformed_scoped_output=%q "+
-				"malformed_scoped_web_search=%q",
-			outputTokens, webSearchRequests, malformedOutput,
-			malformedScopedOutput, malformedScopedWebSearch,
-		)
-	}
-	return nil
-}
-
-func ensureUsageJSONHelper(ctx context.Context, db *sql.DB) error {
-	_, primaryErr := db.ExecContext(ctx, postgresUsageJSONHelperDDL)
-	if primaryErr == nil {
-		primaryErr = probeUsageJSONHelper(ctx, db)
-		if primaryErr == nil {
-			return nil
-		}
-	}
-
-	if _, err := db.ExecContext(ctx, cockroachUsageJSONHelperDDL); err != nil {
-		return fmt.Errorf(
-			"creating usage JSON helper: PL/pgSQL implementation failed: %v; "+
-				"SQL fallback failed: %w",
-			primaryErr, err,
-		)
-	}
-	if err := probeUsageJSONHelper(ctx, db); err != nil {
-		return fmt.Errorf(
-			"validating Cockroach-compatible usage JSON helper "+
-				"after PL/pgSQL implementation failed (%v): %w",
-			primaryErr, err,
-		)
-	}
-	log.Printf(
-		"pg schema: using Cockroach-compatible SQL usage JSON helper "+
-			"after PL/pgSQL probe failed: %v",
-		primaryErr,
-	)
-	return nil
-}
-
 // lockSyncMetadataRow holds a row lock on the sync_metadata row named key
 // until tx ends, creating the row first if needed. A row lock is used instead
 // of pg_advisory_xact_lock because supported CockroachDB versions do not
@@ -960,6 +1085,32 @@ func lockSyncMetadataRow(ctx context.Context, tx *sql.Tx, key string) error {
 		key,
 	); err != nil {
 		return fmt.Errorf("locking sync_metadata row %q: %w", key, err)
+	}
+	return nil
+}
+
+func accountUsageTokensWidePG(ctx context.Context, db pgProjectIdentityExecer) bool {
+	var wide bool
+	err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*) = 4 FROM information_schema.columns
+		WHERE table_schema = current_schema()
+		  AND table_name = 'cursor_usage_events'
+		  AND column_name IN ('input_tokens', 'output_tokens',
+		                      'cache_write_tokens', 'cache_read_tokens')
+		  AND data_type = 'bigint'`).Scan(&wide)
+	return err == nil && wide
+}
+
+func migrateAccountUsageCountersPG(ctx context.Context, db pgProjectIdentityExecer) error {
+	if accountUsageTokensWidePG(ctx, db) {
+		return nil
+	}
+	if _, err := db.ExecContext(ctx, `ALTER TABLE cursor_usage_events
+		ALTER COLUMN input_tokens TYPE BIGINT,
+		ALTER COLUMN output_tokens TYPE BIGINT,
+		ALTER COLUMN cache_write_tokens TYPE BIGINT,
+		ALTER COLUMN cache_read_tokens TYPE BIGINT`); err != nil {
+		return fmt.Errorf("widening PG account usage counters: %w", err)
 	}
 	return nil
 }
@@ -995,22 +1146,18 @@ func EnsureSchema(
 	if _, err := db.ExecContext(ctx, coreDDL); err != nil {
 		return fmt.Errorf("creating pg tables: %w", err)
 	}
+	ensureFrustrationCountsPG(ctx, db)
 	if _, err := db.ExecContext(ctx, frictionDDL); err != nil {
 		return fmt.Errorf("creating pg friction tables: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, frictionReviewDDL); err != nil {
+		return fmt.Errorf("creating pg friction review tables: %w", err)
 	}
 	if err := ensureRawIngestSchemaPG(ctx, db); err != nil {
 		return err
 	}
 	log.Printf(
 		"pg schema: core DDL step completed in %s",
-		time.Since(step).Round(time.Millisecond),
-	)
-	step = time.Now()
-	if err := ensureUsageJSONHelper(ctx, db); err != nil {
-		return err
-	}
-	log.Printf(
-		"pg schema: usage JSON helper step completed in %s",
 		time.Since(step).Round(time.Millisecond),
 	)
 
@@ -1030,6 +1177,12 @@ func EnsureSchema(
 		time.Since(step).Round(time.Millisecond),
 	)
 	if err := migrateMoneyColumnsPG(ctx, db, existingColumns); err != nil {
+		return err
+	}
+	if err := migrateAccountUsageCountersPG(ctx, db); err != nil {
+		return err
+	}
+	if err := migratePricingLayoutPG(ctx, db); err != nil {
 		return err
 	}
 	step = time.Now()
@@ -1080,14 +1233,17 @@ func EnsureSchema(
 			"creating idx_sessions_termination_status: %w", err,
 		)
 	}
-	if err := backfillIsAutomatedPG(ctx, db); err != nil {
+	if err := dedupeStoredDialoguePG(ctx, db); err != nil {
 		return err
 	}
 	log.Printf(
-		"pg schema: automated-session backfill step completed in %s",
+		"pg schema: dialogue deduplication step completed in %s",
 		time.Since(step).Round(time.Millisecond),
 	)
 	step = time.Now()
+	if err := createMissingPreparationIndexesPG(ctx, db); err != nil {
+		return err
+	}
 	if err := createPartialIndexesPG(ctx, db); err != nil {
 		return err
 	}
@@ -1096,7 +1252,27 @@ func EnsureSchema(
 		time.Since(step).Round(time.Millisecond),
 	)
 	step = time.Now()
-	createContentSearchIndexesPG(ctx, db)
+	filled, err := fillMessageUsageCountersPG(ctx, db)
+	if err != nil {
+		return err
+	}
+	log.Printf(
+		"pg schema: message usage counter backfill completed in %s"+
+			" (%d row(s) filled)",
+		time.Since(step).Round(time.Millisecond), filled,
+	)
+	step = time.Now()
+	if err := backfillIsAutomatedPG(ctx, db); err != nil {
+		return err
+	}
+	log.Printf(
+		"pg schema: automated-session backfill step completed in %s",
+		time.Since(step).Round(time.Millisecond),
+	)
+	step = time.Now()
+	if err := createContentSearchIndexesPG(ctx, db); err != nil {
+		log.Printf("pg schema: content search indexes unavailable, search will scan: %v", err)
+	}
 	log.Printf(
 		"pg schema: content search index step completed in %s",
 		time.Since(step).Round(time.Millisecond),
@@ -1112,6 +1288,7 @@ func EnsureSchema(
 		return err
 	}
 	if !runRepair {
+		ensureUsageChangeJournalPG(ctx, db)
 		log.Printf(
 			"pg schema: token coverage repair check completed"+
 				" in %s (repair skipped)",
@@ -1140,6 +1317,7 @@ func EnsureSchema(
 	if err := markTokenCoverageRepairDone(ctx, db); err != nil {
 		return err
 	}
+	ensureUsageChangeJournalPG(ctx, db)
 	log.Printf(
 		"pg schema: token coverage repair marker stored in %s",
 		time.Since(step).Round(time.Millisecond),
@@ -1149,6 +1327,41 @@ func EnsureSchema(
 		time.Since(start).Round(time.Millisecond),
 	)
 	return nil
+}
+
+var preparationIndexesPG = []struct{ name, ddl string }{
+	{"idx_sessions_data_version", `CREATE INDEX IF NOT EXISTS idx_sessions_data_version ON sessions(data_version)`},
+	{"idx_sessions_parentless_workers", `CREATE INDEX IF NOT EXISTS idx_sessions_parentless_workers ON sessions(id) WHERE ` + db.ParentlessWorkerSQL},
+	{"idx_sessions_source_missing", `CREATE INDEX IF NOT EXISTS idx_sessions_source_missing ON sessions(id) WHERE deletion_cause = 'source_missing'`},
+	// Raw session ID lookups seek on the ID tail instead of scanning every
+	// session; see Store.FindSessionIDsByRawSuffix.
+	{"idx_sessions_id_tail", `CREATE INDEX IF NOT EXISTS idx_sessions_id_tail ON sessions((` + pgSessionIDTailExpr + `))`},
+}
+
+// createMissingPreparationIndexesPG serializes publishers upgrading the same
+// archive, since concurrent IF NOT EXISTS creation can still collide.
+func createMissingPreparationIndexesPG(ctx context.Context, pg *sql.DB) error {
+	missing := false
+	for _, index := range preparationIndexesPG {
+		missing = missing || !pgHasIndex(ctx, pg, index.name)
+	}
+	if !missing {
+		return nil
+	}
+	tx, err := pg.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning PG preparation index installation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := lockSyncMetadataRow(ctx, tx, "preparation_indexes_lock"); err != nil {
+		return err
+	}
+	for _, index := range preparationIndexesPG {
+		if _, err := tx.ExecContext(ctx, index.ddl); err != nil {
+			return fmt.Errorf("creating PG preparation index %s: %w", index.name, err)
+		}
+	}
+	return tx.Commit()
 }
 
 // createPartialIndexesPG creates partial indexes on the PG schema.
@@ -1179,6 +1392,12 @@ func createPartialIndexesPG(ctx context.Context, db pgSessionExecer) error {
 		 WHERE token_usage != ''
 		   AND model != ''
 		   AND model != '<synthetic>'`,
+		// idx_messages_usage_counters_missing finds the rows
+		// backfillMessageUsageCountersPG fills. Push writes the counters,
+		// so the index stays empty unless an older binary pushes.
+		`CREATE INDEX IF NOT EXISTS idx_messages_usage_counters_missing
+		 ON messages(session_id, ordinal)
+		 WHERE usage_output_tokens IS NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_activity_timestamp
 		 ON messages(timestamp, session_id, ordinal)
 		 WHERE timestamp IS NOT NULL`,
@@ -1211,74 +1430,44 @@ func createPartialIndexesPG(ctx context.Context, db pgSessionExecer) error {
 	return nil
 }
 
-// createContentSearchIndexesPG adds a pg_trgm GIN index on messages.content so
-// the content search (ILIKE '%pattern%') is index-accelerated instead of
-// sequentially scanning the messages table as history grows.
-//
-// It is best-effort and never fails schema setup. pg_trgm is a trusted
-// extension on PostgreSQL 13+, but a role without CREATE privilege (or a
-// managed instance that blocks it) must still get a working — if slower —
-// store. Each statement runs in its own implicit transaction, so a failed
-// CREATE EXTENSION does not poison the rest of EnsureSchema. The gin_trgm_ops
-// operator class lives in whatever schema pg_trgm was installed in, which may
-// not be on the connection search_path (Open sets it to the target schema
-// only), so the opclass is schema-qualified to the extension's namespace.
-func createContentSearchIndexesPG(ctx context.Context, db *sql.DB) {
-	if _, err := db.ExecContext(ctx,
-		`CREATE EXTENSION IF NOT EXISTS pg_trgm`,
-	); err != nil {
-		log.Printf(
-			"pg schema: pg_trgm unavailable, content search will scan: %v", err,
-		)
-		return
+// createContentSearchIndexesPG accelerates content, dialogue, and thinking
+// substring searches. Callers decide whether unavailable pg_trgm is fatal.
+// The opclass is qualified because the extension can live outside search_path.
+func createContentSearchIndexesPG(ctx context.Context, pg interface {
+	pgSessionExecer
+	hostedQuerier
+},
+) error {
+	if _, err := pg.ExecContext(ctx, `CREATE EXTENSION IF NOT EXISTS pg_trgm`); err != nil {
+		return err
 	}
 	var extSchema string
-	if err := db.QueryRowContext(ctx,
-		`SELECT n.nspname FROM pg_extension e
-		 JOIN pg_namespace n ON n.oid = e.extnamespace
-		 WHERE e.extname = 'pg_trgm'`,
-	).Scan(&extSchema); err != nil {
-		log.Printf("pg schema: locating pg_trgm schema failed: %v", err)
-		return
+	if err := pg.QueryRowContext(ctx, `SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid=e.extnamespace WHERE e.extname='pg_trgm'`).Scan(&extSchema); err != nil {
+		return err
 	}
 	quotedExt, err := quoteIdentifier(extSchema)
 	if err != nil {
-		log.Printf("pg schema: invalid pg_trgm schema %q: %v", extSchema, err)
-		return
+		return err
 	}
-	// fastupdate=off keeps the index bounded: the default fastupdate=on
-	// buffers inserts into a pending list that only VACUUM merges, which grows
-	// unbounded when continuous ingest starves autovacuum.
-	if _, err := db.ExecContext(ctx, fmt.Sprintf(
-		`CREATE INDEX IF NOT EXISTS idx_messages_content_trgm
-		 ON messages USING gin (content %s.gin_trgm_ops)
-		 WITH (fastupdate = off)`, quotedExt,
-	)); err != nil {
-		log.Printf(
-			"pg schema: creating messages.content trigram index failed: %v", err,
-		)
-		return
+	// Disable the pending list so continuous ingest cannot grow it unbounded.
+	for _, index := range []struct{ name, expression string }{
+		{"idx_messages_content_trgm", "content"},
+		{"idx_messages_dialogue_trgm", "(COALESCE(dialogue_text, content))"},
+		{"idx_messages_thinking_trgm", "thinking_text"},
+	} {
+		if _, err := pg.ExecContext(ctx, fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON messages USING gin (%s %s.gin_trgm_ops) WITH (fastupdate = off)`, index.name, index.expression, quotedExt)); err != nil {
+			return err
+		}
 	}
-	// CREATE INDEX IF NOT EXISTS only applies WITH (fastupdate = off) on
-	// first creation. Re-apply on every boot so stores upgraded from a
-	// prior schema (which left fastupdate=on) also get the bounded index.
-	if _, err := db.ExecContext(ctx,
-		`ALTER INDEX idx_messages_content_trgm SET (fastupdate = off)`,
-	); err != nil {
-		log.Printf(
-			"pg schema: disabling fastupdate on messages.content trigram index failed: %v",
-			err,
-		)
-	}
+	// Existing content indexes may still have fastupdate enabled.
+	_, err = pg.ExecContext(ctx, `ALTER INDEX idx_messages_content_trgm SET (fastupdate = off)`)
+	return err
 }
 
-// backfillIsAutomatedPG verifies is_automated for all PG
-// sessions, correcting both false negatives (new patterns or
-// stale imported rows) and stale false positives (patterns
-// tightened since last run). The stored classifier hash records
-// which classifier wrote the current audit, but it is not a
-// complete integrity marker: rows can arrive from stale clients
-// after the hash was stamped.
+// backfillIsAutomatedPG corrects stale automation verdicts. Per-row
+// classifier stamps track freshness when available; deleting the global
+// metadata key requests a complete recheck.
+// Run repairs that bump updated_at first, because they clear audit stamps.
 func backfillIsAutomatedPG(
 	ctx context.Context, pg *sql.DB,
 ) error {
@@ -1286,26 +1475,33 @@ func backfillIsAutomatedPG(
 	return err
 }
 
-// runSchemaDataRepairsPG runs the non-DDL correctness repairs that
+// runSchemaDataRepairsPG runs the correctness repairs that
 // EnsureSchema performs: it recomputes is_automated, backfills
-// source-curation baselines, scrubs stored project remotes, and repairs
-// token-coverage flags. These issue only row-level writes, so the
-// compatible-schema fast path can run them without the index and
-// column DDL that can block concurrent pg serve reads (issue #887).
+// source-curation baselines, scrubs stored project remotes, fills message
+// usage counters an older binary left empty, and repairs token-coverage
+// flags. The one-time automation tracking installation
+// holds an exclusive sessions lock until commit, blocking reads and writes.
+// Subsequent repairs use row-level writes.
 func runSchemaDataRepairsPG(ctx context.Context, db *sql.DB) error {
-	if err := backfillIsAutomatedPG(ctx, db); err != nil {
-		return err
-	}
 	if _, err := runSourceCurationBackfill(ctx, db, false); err != nil {
 		return err
 	}
 	if err := backfillCodexThreadScopePG(ctx, db); err != nil {
 		return err
 	}
+	if err := dedupeStoredDialoguePG(ctx, db); err != nil {
+		return err
+	}
 	if err := repairLegacySourceMissingDeletionPG(ctx, db); err != nil {
 		return err
 	}
 	if _, err := scrubProjectIdentityGitRemoteCredentialsPG(ctx, db); err != nil {
+		return err
+	}
+	if _, err := fillMessageUsageCountersPG(ctx, db); err != nil {
+		return err
+	}
+	if err := backfillIsAutomatedPG(ctx, db); err != nil {
 		return err
 	}
 	runRepair, err := shouldRunTokenCoverageRepair(ctx, db, false)
@@ -1321,6 +1517,26 @@ func runSchemaDataRepairsPG(ctx context.Context, db *sql.DB) error {
 	return markTokenCoverageRepairDone(ctx, db)
 }
 
+// dedupeStoredDialoguePG applies db.StoredDialogue to rows pushed before it:
+// a dialogue_text that repeats content on a message without thinking text
+// becomes NULL, which search already reads as content. The marker and the
+// UPDATE share one statement, so the rewrite runs once and a failure retries
+// it whole.
+func dedupeStoredDialoguePG(ctx context.Context, pg pgSessionExecer) error {
+	_, err := pg.ExecContext(ctx, `
+		WITH migration AS (
+			INSERT INTO sync_metadata (key, value) VALUES ($1, '1')
+			ON CONFLICT (key) DO NOTHING RETURNING key
+		)
+		UPDATE messages SET dialogue_text = NULL
+		WHERE dialogue_text = content AND thinking_text = ''
+		  AND EXISTS (SELECT 1 FROM migration)`, dialogueDedupeMetadataKey)
+	if err != nil {
+		return fmt.Errorf("removing duplicate dialogue text: %w", err)
+	}
+	return nil
+}
+
 // Backfill only thread deletion decisions present before per-file identities.
 // The marker and updates share one statement so retries cannot widen subsequent
 // per-file actions. Hosted raw curation uses separate tables and identities.
@@ -1332,6 +1548,7 @@ func backfillCodexThreadScopePG(ctx context.Context, pg pgSessionExecer) error {
 		), exclusions AS (
 			UPDATE excluded_sessions SET include_codex_pages = TRUE
 			WHERE id ~ $2 AND EXISTS (SELECT 1 FROM migration)
+			RETURNING id
 		)
 		UPDATE sessions SET trash_includes_codex_pages = TRUE,
 			source_trash_includes_codex_pages = (source_deleted_at IS NOT NULL)
@@ -1346,17 +1563,19 @@ func backfillCodexThreadScopePG(ctx context.Context, pg pgSessionExecer) error {
 	return nil
 }
 
-// repairLegacySourceMissingDeletionPG restores mirror rows written while
-// source absence was represented as deletion. Source availability is local
-// SQLite sync state; PostgreSQL retains only user-owned deletion state.
-func repairLegacySourceMissingDeletionPG(ctx context.Context, pg *sql.DB) error {
-	_, err := pg.ExecContext(ctx, `
+const repairLegacySourceMissingDeletionSQL = `
 		UPDATE sessions
 		SET deleted_at = NULL,
 		    source_deleted_at = NULL,
 		    deletion_cause = NULL,
 		    updated_at = NOW()
-		WHERE deletion_cause = 'source_missing'`)
+		WHERE deletion_cause = 'source_missing'`
+
+// repairLegacySourceMissingDeletionPG restores mirror rows written while
+// source absence was represented as deletion. Source availability is local
+// SQLite sync state; PostgreSQL retains only user-owned deletion state.
+func repairLegacySourceMissingDeletionPG(ctx context.Context, pg *sql.DB) error {
+	_, err := pg.ExecContext(ctx, repairLegacySourceMissingDeletionSQL)
 	if err != nil {
 		return fmt.Errorf("repairing legacy PG source-missing deletions: %w", err)
 	}
@@ -1579,36 +1798,6 @@ func markProjectIdentityRemoteScrubDone(
 		return fmt.Errorf(
 			"storing project identity remote scrub metadata: %w", err,
 		)
-	}
-	return nil
-}
-
-func batchUpdateAutomatedPG(
-	ctx context.Context, pg *sql.DB,
-	ids []string, val bool,
-) error {
-	const batchSize = 500
-	for i := 0; i < len(ids); i += batchSize {
-		end := min(i+batchSize, len(ids))
-		batch := ids[i:end]
-		pb := &paramBuilder{}
-		valPh := pb.add(val)
-		phs := make([]string, len(batch))
-		for j, id := range batch {
-			phs[j] = pb.add(id)
-		}
-		_, err := pg.ExecContext(ctx,
-			"UPDATE sessions SET is_automated = "+valPh+
-				" WHERE id IN ("+
-				strings.Join(phs, ",")+
-				")",
-			pb.args...,
-		)
-		if err != nil {
-			return fmt.Errorf(
-				"updating is_automated in PG: %w", err,
-			)
-		}
 	}
 	return nil
 }
@@ -2107,7 +2296,7 @@ func inferTokenCoverage(
 }
 
 // CheckSchemaCompat verifies that the PG schema has all columns
-func pgHasTable(ctx context.Context, db *sql.DB, name string) bool {
+func pgHasTable(ctx context.Context, db hostedQuerier, name string) bool {
 	var n int
 	err := db.QueryRowContext(ctx,
 		"SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = $1",
@@ -2134,13 +2323,6 @@ func pgHasIndex(ctx context.Context, db *sql.DB, name string) bool {
 func CheckSchemaCompat(
 	ctx context.Context, db *sql.DB,
 ) error {
-	if err := probeUsageJSONHelper(ctx, db); err != nil {
-		return fmt.Errorf(
-			"usage JSON helper missing or incompatible: %w",
-			err,
-		)
-	}
-
 	_, err := db.ExecContext(ctx,
 		`SELECT updated_at, `+pgSessionCols+`
 		 FROM sessions LIMIT 0`)
@@ -2186,10 +2368,11 @@ func CheckSchemaCompat(
 	}
 
 	_, err = db.ExecContext(ctx,
-		`SELECT session_id, ordinal, role, content, thinking_text,
+		`SELECT session_id, ordinal, role, content, thinking_text, dialogue_text,
 			timestamp, has_thinking, has_tool_use,
 			content_length, is_system, model, reasoning_effort, token_usage,
 			context_tokens, output_tokens, provider_id,
+			usage_output_tokens, usage_web_search_requests,
 			has_context_tokens, has_output_tokens,
 			claude_message_id, claude_request_id,
 			source_type, source_subtype, prompt_source, source_uuid,
@@ -2281,6 +2464,16 @@ func CheckSchemaCompat(
 		)
 	}
 
+	_, err = db.ExecContext(ctx,
+		`SELECT session_id, `+sessionUsageTotalColumns+`
+		 FROM session_usage_totals LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"session_usage_totals table missing required columns: %w",
+			err,
+		)
+	}
+
 	hasModelPricing := true
 	_, err = db.ExecContext(ctx,
 		`SELECT input_microdollars_per_mtok,
@@ -2300,6 +2493,18 @@ func CheckSchemaCompat(
 	}
 
 	if hasModelPricing {
+		types, err := pricingTimeColumnTypesPG(ctx, db)
+		if err != nil {
+			return err
+		}
+		for _, table := range pricingTimeTables {
+			if types[table]["updated_at"] == "text" {
+				return errors.New(
+					"pg pricing tables come from an older agentsview version; " +
+						"run `agentsview replica pg push` to upgrade them")
+			}
+		}
+
 		_, err = db.ExecContext(ctx,
 			`SELECT model_pattern, above_input_tokens,
 				input_microdollars_per_mtok, output_microdollars_per_mtok,
@@ -2338,7 +2543,7 @@ func CheckSchemaCompat(
 
 	if pgHasTable(ctx, db, "cursor_usage_events") {
 		_, err = db.ExecContext(ctx,
-			`SELECT id, occurred_at, model, kind,
+			`SELECT id, agent, occurred_at, model, kind,
 				input_tokens, output_tokens,
 				cache_write_tokens, cache_read_tokens,
 				charged_microdollars, cursor_token_fee_microdollars,
@@ -2413,6 +2618,13 @@ func CheckSchemaCompat(
 		return fmt.Errorf(
 			"sync_metadata table missing required columns: %w", err)
 	}
+	_, err = db.ExecContext(ctx,
+		`SELECT session_id, source_kind, message_ordinal, call_index, event_index,
+			image_index, image_hash, processor, provider, model, revision, text
+		 FROM image_text LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf("image_text table missing required columns: %w", err)
+	}
 	return nil
 }
 
@@ -2452,7 +2664,9 @@ func pushSchemaCurrent(ctx context.Context, db *sql.DB) bool {
 	if err := checkPushSchemaCompat(ctx, db); err != nil {
 		return false
 	}
-	if !pgHasTable(ctx, db, "model_pricing") ||
+	if !pgHasTable(ctx, db, "commit_links") ||
+		!pgHasTable(ctx, db, "retained_commit_links") ||
+		!pgHasTable(ctx, db, "model_pricing") ||
 		!pgHasTable(ctx, db, "model_pricing_bands") ||
 		!pgHasTable(ctx, db, "genai_pricing") ||
 		!pgHasTable(ctx, db, "source_archives") ||
@@ -2462,6 +2676,12 @@ func pushSchemaCurrent(ctx context.Context, db *sql.DB) bool {
 		!pgHasTable(ctx, db, "source_session_project_identity_snapshot_scopes") ||
 		!pgHasTable(ctx, db, "source_worktree_project_mappings") ||
 		!pgHasTable(ctx, db, "source_worktree_project_mapping_scopes") ||
+		!pgHasTable(ctx, db, "diagnostic_events") ||
+		!pgHasTable(ctx, db, "friction_digests") ||
+		!pgHasTable(ctx, db, "friction_digest_sessions") ||
+		!pgHasTable(ctx, db, "friction_patterns") ||
+		!pgHasTable(ctx, db, "friction_issue_links") ||
+		!pgHasTable(ctx, db, "friction_filing_state") ||
 		!pgHasTable(ctx, db, "cursor_usage_events") ||
 		!pgHasTable(ctx, db, "friction_findings") {
 		return false
@@ -2472,17 +2692,24 @@ func pushSchemaCurrent(ctx context.Context, db *sql.DB) bool {
 	// so repeated pushes cannot duplicate cursor usage rows.
 	// A push may provision the schema for a read-only serve role. Include
 	// the Activity index so that upgrading through push installs it too.
-	return pgHasIndex(ctx, db, "idx_cursor_usage_events_dedup") &&
+	return accountUsageTokensWidePG(ctx, db) &&
+		pgHasIndex(ctx, db, "idx_cursor_usage_events_dedup") &&
 		pgHasIndex(ctx, db, "idx_tool_result_events_terminal")
 }
 
 // CheckDataVersionCompat rejects PG datasets containing rows written by a
 // newer agentsview parser. PG does not have SQLite's global user_version, so
-// the highest session data_version is the compatibility marker.
+// sessions carry the parser version.
 func CheckDataVersionCompat(ctx context.Context, pg *sql.DB) error {
+	return checkDataVersionCompat(ctx, pg)
+}
+
+const maxDataVersionSQL = `SELECT COALESCE(MAX(data_version), 0) FROM sessions`
+
+func checkDataVersionCompat(ctx context.Context, pg hostedQuerier) error {
 	var version int
 	err := pg.QueryRowContext(ctx,
-		`SELECT COALESCE(MAX(data_version), 0) FROM sessions`,
+		maxDataVersionSQL,
 	).Scan(&version)
 	if err != nil {
 		if isUndefinedTable(err) || isUndefinedColumn(err) {
@@ -2491,10 +2718,7 @@ func CheckDataVersionCompat(ctx context.Context, pg *sql.DB) error {
 		return fmt.Errorf("checking PG data version: %w", err)
 	}
 	if version > db.CurrentDataVersion() {
-		return &db.DataVersionTooNewError{
-			DatabaseVersion: version,
-			BinaryVersion:   db.CurrentDataVersion(),
-		}
+		return &db.DataVersionTooNewError{DatabaseVersion: version, BinaryVersion: db.CurrentDataVersion()}
 	}
 	return nil
 }

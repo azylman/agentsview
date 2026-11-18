@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"syscall"
 	"testing"
 	"time"
 
@@ -17,13 +16,8 @@ import (
 	"go.kenn.io/agentsview/internal/apiclient"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/storage"
+	"go.kenn.io/kit/safefileio"
 )
-
-func TestDuckDBLongRunningSignalsIncludeSIGTERM(t *testing.T) {
-	signals := duckDBLongRunningSignals()
-	assert.Contains(t, signals, os.Interrupt)
-	assert.Contains(t, signals, syscall.SIGTERM)
-}
 
 func TestResolveDuckDBPushProjects(t *testing.T) {
 	tests := []projectResolutionCase[DuckDBPushConfig]{
@@ -378,8 +372,7 @@ func TestWriteDuckDBPushDiagnosticsReportsResumedRebuildKept(t *testing.T) {
 }
 
 // TestWriteDuckDBPushDiagnosticsReportsDeferredMode verifies a deferred
-// watch-mode push (mirror held by a live serve; see
-// storage.MirrorPushOptions.Automatic) prints its mode and reason
+// watch-mode push waiting for the rebuild lock prints its mode and reason
 // instead of the incremental or rebuild counters, none of which exist for
 // a push that touched nothing.
 func TestWriteDuckDBPushDiagnosticsReportsDeferredMode(t *testing.T) {
@@ -388,13 +381,13 @@ func TestWriteDuckDBPushDiagnosticsReportsDeferredMode(t *testing.T) {
 	writeDuckDBPushDiagnostics(&out, storage.MirrorPushResult{
 		Diagnostics: storage.MirrorPushDiagnostics{
 			Deferred:       true,
-			DeferredReason: "mirror is locked by a serving process; deferring until it is released",
+			DeferredReason: "another push is rebuilding the mirror; deferring until it finishes",
 		},
 	})
 
 	got := out.String()
 	assert.Contains(t, got,
-		"DuckDB push mode: deferred (mirror is locked by a serving process; deferring until it is released)")
+		"DuckDB push mode: deferred (another push is rebuilding the mirror; deferring until it finishes)")
 	assert.NotContains(t, got, "DuckDB push wrote:",
 		"a deferred push wrote nothing and must not print write counters")
 }
@@ -474,23 +467,50 @@ func duckDBPushDaemonServerAt(
 }
 
 func TestResolveQuackServeToken(t *testing.T) {
+	secretDir := t.TempDir()
+	// Secret files under a directory others can write are refused.
+	require.NoError(t, os.Chmod(secretDir, 0o700))
+	tokenFile := filepath.Join(secretDir, "quack-token")
+	file, err := safefileio.CreatePrivateFile(tokenFile)
+	require.NoError(t, err)
+	_, err = file.WriteString("file-token\n")
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+	missingFile := filepath.Join(secretDir, "absent")
+
 	tests := []struct {
 		name       string
 		flagToken  string
-		configured string
+		configured config.DuckDBConfig
 		wantToken  string
 		wantErr    string
 	}{
 		{
 			name:       "flag token wins",
 			flagToken:  "flag-token",
-			configured: "config-token",
+			configured: config.DuckDBConfig{Token: "config-token"},
 			wantToken:  "flag-token",
 		},
 		{
 			name:       "configured token used",
-			configured: "config-token",
+			configured: config.DuckDBConfig{Token: "config-token"},
 			wantToken:  "config-token",
+		},
+		{
+			name:       "token_file used",
+			configured: config.DuckDBConfig{TokenFile: tokenFile},
+			wantToken:  "file-token",
+		},
+		{
+			name:       "flag token wins over an unreadable token_file",
+			flagToken:  "flag-token",
+			configured: config.DuckDBConfig{TokenFile: missingFile},
+			wantToken:  "flag-token",
+		},
+		{
+			name:       "unreadable token_file is an error",
+			configured: config.DuckDBConfig{TokenFile: missingFile},
+			wantErr:    "[duckdb] token_file",
 		},
 		{
 			name:    "requires explicit token",

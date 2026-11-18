@@ -1,11 +1,10 @@
-//go:build duckdbtest && !(windows && arm64)
+//go:build duckdb && duckdbtest && !(windows && arm64)
 
 package duckdb
 
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"net"
 	"path/filepath"
 	"testing"
@@ -15,131 +14,12 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/storage"
 )
 
-func TestQuackLoopbackAttachRoundTrip(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "agentsview-quack.duckdb")
-	uri := "quack:127.0.0.1:" + freeTCPPort(t)
-	const token = "agentsview-duckdbtest-token-0001"
-
-	server, err := sql.Open("duckdb", path)
-	require.NoError(t, err, "open server DuckDB file")
-	server.SetMaxOpenConns(1)
-	server.SetMaxIdleConns(1)
-	t.Cleanup(func() {
-		require.NoError(t, server.Close(), "close server DuckDB file")
-	})
-
-	require.NoError(t, server.PingContext(ctx), "ping server DuckDB")
-	require.NoError(t, server.PingContext(ctx), "ping server DuckDB")
-
-	var version string
-	require.NoError(t,
-		server.QueryRowContext(ctx, "SELECT version()").Scan(&version),
-		"query server DuckDB version",
-	)
-	t.Logf("duckdb version: %s; duckdb-go version: %s",
-		version, duckDBGoModuleVersion)
-	assert.NotEmpty(t, version)
-
-	_, err = server.ExecContext(ctx, "INSTALL quack")
-	require.NoError(t, err, "install quack extension")
-	_, err = server.ExecContext(ctx, "LOAD quack")
-	require.NoError(t, err, "load quack extension")
-
-	_, err = server.ExecContext(ctx,
-		`CREATE TABLE local_seed (id TEXT PRIMARY KEY, value INTEGER)`,
-	)
-	require.NoError(t, err, "create seed table")
-	_, err = server.ExecContext(ctx,
-		`INSERT INTO local_seed VALUES (?, ?)`,
-		"seed", 41,
-	)
-	require.NoError(t, err, "insert seed row")
-
-	var listenURI, listenURL sql.NullString
-	err = server.QueryRowContext(ctx,
-		`SELECT listen_uri, listen_url FROM quack_serve(?, token => ?)`,
-		uri, token,
-	).Scan(&listenURI, &listenURL)
-	require.NoError(t, err, "start quack server")
-	if listenURI.Valid && listenURI.String != "" {
-		uri = listenURI.String
-	}
-	if listenURL.Valid {
-		assert.NotContains(t, listenURL.String, token)
-	}
-	t.Cleanup(func() {
-		_, stopErr := server.ExecContext(ctx, `CALL quack_stop(?)`, uri)
-		require.NoError(t, stopErr, "stop quack server")
-	})
-
-	client, err := sql.Open("duckdb", "")
-	require.NoError(t, err, "open client DuckDB")
-	client.SetMaxOpenConns(1)
-	client.SetMaxIdleConns(1)
-	t.Cleanup(func() {
-		require.NoError(t, client.Close(), "close client DuckDB")
-	})
-	require.NoError(t, client.PingContext(ctx), "ping client DuckDB")
-
-	_, err = client.ExecContext(ctx, "LOAD quack")
-	require.NoError(t, err, "load quack extension in client")
-
-	attachSQL := fmt.Sprintf(
-		`ATTACH '%s' AS remote_db (TOKEN '%s')`,
-		uri, token,
-	)
-	_, err = client.ExecContext(ctx, attachSQL)
-	require.NoError(t, err, "attach quack endpoint")
-
-	var got int
-	require.NoError(t,
-		client.QueryRowContext(ctx,
-			`SELECT value FROM remote_db.local_seed WHERE id = ?`,
-			"seed",
-		).Scan(&got),
-		"query remote seed row",
-	)
-	assert.Equal(t, 41, got)
-
-	_, err = client.ExecContext(ctx, `FROM remote_db.query(?)`,
-		`INSERT INTO local_seed VALUES ('seed', 43)
-		 ON CONFLICT(id) DO UPDATE SET value = excluded.value`,
-	)
-	require.NoError(t, err, "upsert seed row through quack query")
-
-	require.NoError(t,
-		server.QueryRowContext(ctx,
-			`SELECT value FROM local_seed WHERE id = ?`,
-			"seed",
-		).Scan(&got),
-		"query upserted seed row on server",
-	)
-	assert.Equal(t, 43, got)
-
-	_, err = client.ExecContext(ctx,
-		`CREATE TABLE remote_db.remote_write
-		 AS SELECT 'client'::TEXT AS id, 42::INTEGER AS value`,
-	)
-	require.NoError(t, err, "create remote table through attachment")
-
-	var remoteValue int
-	require.NoError(t,
-		server.QueryRowContext(ctx,
-			`SELECT value FROM remote_write WHERE id = ?`,
-			"client",
-		).Scan(&remoteValue),
-		"query row written through quack attachment",
-	)
-	assert.Equal(t, 42, remoteValue)
-}
-
 func TestQuackStoreReattachesAfterServerRestart(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "agentsview-quack-reattach.duckdb")
 	uri := "quack:127.0.0.1:" + freeTCPPort(t)
 	const token = "agentsview-duckdbtest-token-0009"
@@ -189,7 +69,7 @@ func TestQuackStoreReattachesAfterServerRestart(t *testing.T) {
 }
 
 func TestQuackStoreReattachesAfterFailedReattach(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "agentsview-quack-reattach-failure.duckdb")
 	uri := "quack:127.0.0.1:" + freeTCPPort(t)
 	const token = "agentsview-duckdbtest-token-0011"
@@ -216,19 +96,24 @@ func TestQuackStoreReattachesAfterFailedReattach(t *testing.T) {
 	_, err = server.ExecContext(ctx, `CALL quack_stop(?)`, uri)
 	require.NoError(t, err, "stop quack server")
 
-	var got int
-	err = store.queryRowContext(ctx,
-		`SELECT value FROM failed_reattach_test WHERE id = ?`,
-		"seed",
-	).Scan(&got)
-	require.Error(t, err, "query while server is stopped should fail")
+	// The extension keeps an established session open after quack_stop, so
+	// a query alone need not fail here. Reattach directly: it detaches, then
+	// cannot attach to the stopped server, which strands the client with no
+	// attachment.
+	store.quack.reattachMu.Lock()
+	err = store.quack.reattachLocked(ctx)
+	store.quack.reattachMu.Unlock()
+	require.Error(t, err, "reattach while server is stopped should fail")
+	var attached int
+	require.NoError(t, store.quack.DB().QueryRowContext(ctx,
+		`SELECT count(*) FROM duckdb_databases() WHERE database_name = ?`,
+		quackAttachmentName,
+	).Scan(&attached))
+	require.Zero(t, attached, "failed reattach should leave no attachment")
 
 	_, err = server.ExecContext(ctx, `CALL quack_serve(?, token => ?)`, uri, token)
 	require.NoError(t, err, "restart quack server")
-	_, err = store.quack.DB().ExecContext(ctx, "USE memory")
-	require.NoError(t, err, "select local catalog before forced detach")
-	_, err = store.quack.DB().ExecContext(ctx, "DETACH "+quackAttachmentName)
-	require.NoError(t, err, "force stranded detached Quack attachment")
+	var got int
 	require.NoError(t,
 		store.queryRowContext(ctx,
 			`SELECT value FROM failed_reattach_test WHERE id = ?`,
@@ -240,7 +125,8 @@ func TestQuackStoreReattachesAfterFailedReattach(t *testing.T) {
 }
 
 func TestQuackStoreAnalyticsDashboardReads(t *testing.T) {
-	ctx := context.Background()
+	t.Setenv("CACHE_DIRECTORY", t.TempDir())
+	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "agentsview-quack-analytics.duckdb")
 	uri := "quack:127.0.0.1:" + freeTCPPort(t)
 	const token = "agentsview-duckdbtest-token-0006"
@@ -249,14 +135,28 @@ func TestQuackStoreAnalyticsDashboardReads(t *testing.T) {
 	// handed to quack_serve for read access.
 	local := newLocalDB(t)
 	seedDuckDBSyncFixture(t, local)
+	const frustrationID = "duck-sync-frustration"
+	const frustrationPrompt = "this is broken"
+	const frustrationTime = "2026-01-10T03:00:00.000Z"
+	_, err := local.WriteSessionBatchAtomic(ctx, []db.SessionBatchWrite{{
+		Session:     syncSession(frustrationID, "alpha", frustrationPrompt, frustrationTime, 1),
+		Messages:    []db.Message{syncMessage(frustrationID, 0, "user", frustrationPrompt, frustrationTime)},
+		Signals:     db.SessionSignalUpdate{QualitySignals: db.QualitySignals{Version: db.CurrentQualitySignalVersion}},
+		DataVersion: 1, ReplaceMessages: true,
+	}})
+	require.NoError(t, err)
+	require.NoError(t, local.UpdateSessionSignals(ctx, "duck-sync-alpha", db.SessionSignalUpdate{
+		QualitySignals:   db.QualitySignals{Version: db.CurrentQualitySignalVersion},
+		ToolObservations: []db.ToolObservation{{MessageOrdinal: 1, Outcome: "empty"}},
+	}))
 	seedDuckEdit(
 		t, local, "alpha", "duck-sync-edit",
 		0, 0, "src/main.go", "2026-01-10T02:00:00Z",
 	)
 	result, err := Push(ctx, path, local, "quack-client", storage.MirrorPushOptions{}, true, nil)
 	require.NoError(t, err, "push analytics fixture into local mirror")
-	assert.Equal(t, 3, result.SessionsPushed)
-	assert.Equal(t, 4, result.MessagesPushed)
+	assert.Equal(t, 4, result.SessionsPushed)
+	assert.Equal(t, 5, result.MessagesPushed)
 
 	openQuackMirrorServer(t, ctx, path, uri, token)
 
@@ -265,6 +165,15 @@ func TestQuackStoreAnalyticsDashboardReads(t *testing.T) {
 	t.Cleanup(func() {
 		require.NoError(t, store.Close(), "close Quack-backed store")
 	})
+	require.NoError(t, store.OpenActivityReportDisk(ctx))
+	usageReads := 0
+	previousUsageObserver := usagePartReadObserver
+	usagePartReadObserver = func([]string) { usageReads++ }
+	t.Cleanup(func() { usagePartReadObserver = previousUsageObserver })
+	usage, err := store.GetDailyUsage(ctx, db.UsageFilter{From: "2026-01-10", To: "2026-01-10", Timezone: "UTC"})
+	require.NoError(t, err)
+	require.Positive(t, usage.Totals.OutputTokens)
+	require.Zero(t, usageReads)
 
 	configStatus, err := ReadStatusFromConfig(ctx, config.DuckDBConfig{
 		URL:         uri,
@@ -279,8 +188,8 @@ func TestQuackStoreAnalyticsDashboardReads(t *testing.T) {
 	assert.Equal(t, SchemaVersion, configStatus.SchemaVersion)
 	assert.Equal(t, db.CurrentDataVersion(), configStatus.DataVersion)
 	assert.Empty(t, configStatus.Scope, "unfiltered push canonicalizes to empty scope")
-	assert.Equal(t, 3, configStatus.DuckDBSessions)
-	assert.Equal(t, 4, configStatus.DuckDBMessages)
+	assert.Equal(t, 4, configStatus.DuckDBSessions)
+	assert.Equal(t, 5, configStatus.DuckDBMessages)
 
 	filter := db.AnalyticsFilter{
 		From:     "2026-01-10",
@@ -289,11 +198,11 @@ func TestQuackStoreAnalyticsDashboardReads(t *testing.T) {
 	}
 	page, err := store.ListSessions(ctx, db.SessionFilter{Limit: 10})
 	require.NoError(t, err, "list sessions through Quack")
-	assert.Len(t, page.Sessions, 3)
+	assert.Len(t, page.Sessions, 4)
 
 	sidebar, err := store.GetSidebarSessionIndex(ctx, db.SessionFilter{})
 	require.NoError(t, err, "read sidebar session index through Quack")
-	assert.Equal(t, 3, sidebar.Total)
+	assert.Equal(t, 4, sidebar.Total)
 
 	search, err := store.Search(ctx, db.SearchFilter{Query: "alpha", Limit: 10})
 	require.NoError(t, err, "search sessions through Quack")
@@ -349,6 +258,18 @@ func TestQuackStoreAnalyticsDashboardReads(t *testing.T) {
 	tools, err := store.GetAnalyticsTools(ctx, filter)
 	require.NoError(t, err, "read tool analytics through Quack")
 	assert.Equal(t, 2, tools.TotalCalls)
+	signals, err := store.GetAnalyticsSignals(ctx, filter)
+	require.NoError(t, err, "read Signals through Quack")
+	assert.Equal(t, 1, signals.QualityHealth.Totals.FrustrationMarkerCount)
+	zoneFilter := db.AnalyticsFilter{From: "2026-01-09", To: "2026-01-10", Timezone: "America/New_York", ToolName: "search", ToolCategory: "search"}
+	zoneTools, err := store.GetAnalyticsTools(ctx, zoneFilter)
+	require.NoError(t, err)
+	assert.Equal(t, 1, zoneTools.TotalCalls)
+	evidence, err := store.GetAnalyticsSignalSessions(ctx, zoneFilter, "tool_empty_rate", 10)
+	require.NoError(t, err)
+	require.Len(t, evidence.Sessions, 1)
+	assert.Equal(t, 1, evidence.Sessions[0].SignalTotal)
+	assert.Equal(t, new(1), evidence.Sessions[0].MessageOrdinal)
 
 	edits, err := store.RecentEdits(ctx, db.RecentEditsParams{})
 	require.NoError(t, err, "read recent edits through Quack")
@@ -362,6 +283,57 @@ func TestQuackStoreAnalyticsDashboardReads(t *testing.T) {
 	)
 	require.NoError(t, err, "read activity report through Quack")
 	assert.GreaterOrEqual(t, report.Totals.Sessions, 1)
+}
+
+func TestQuackTrendsReuseAcrossRestart(t *testing.T) {
+	cache := t.TempDir()
+	t.Setenv("CACHE_DIRECTORY", cache)
+	ctx := t.Context()
+	path := filepath.Join(t.TempDir(), "trends.duckdb")
+	uri := "quack:127.0.0.1:" + freeTCPPort(t)
+	const token = "agentsview-duckdbtest-token-trends"
+	local := newLocalDB(t)
+	dbtest.SeedTrendsWindow(t, local)
+	_, err := Push(ctx, path, local, "m", storage.MirrorPushOptions{}, false, nil)
+	require.NoError(t, err)
+	openQuackMirrorServer(t, ctx, path, uri, token)
+	terms, err := db.ParseTrendTerms([]string{"fallback"})
+	require.NoError(t, err)
+	filter := db.AnalyticsFilter{From: "2025-03-10", To: "2025-03-10", Timezone: "UTC"}
+	var reads [][]string
+	reset := db.SetTrendPartsReadObserver(func(ids []string) { reads = append(reads, append([]string(nil), ids...)) })
+	t.Cleanup(reset)
+	open := func(target string) *Store {
+		store, err := NewQuackStore(ctx, target, token, false, 0)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, store.Close()) })
+		require.NoError(t, store.OpenActivityReportDisk(ctx))
+		return store
+	}
+	first := open(uri)
+	got, err := first.GetTrendsTerms(ctx, filter, terms, "day")
+	require.NoError(t, err)
+	require.Equal(t, 1, got.Series[0].Total)
+	require.NotEmpty(t, reads)
+	require.NoError(t, first.Close())
+	reads = nil
+	restarted := open(uri)
+	again, err := restarted.GetTrendsTerms(ctx, filter, terms, "day")
+	require.NoError(t, err)
+	require.Equal(t, got, again)
+	require.Empty(t, reads)
+	require.NoError(t, restarted.Close())
+
+	otherPath := filepath.Join(t.TempDir(), "other.duckdb")
+	_, err = Push(ctx, otherPath, local, "m", storage.MirrorPushOptions{}, false, nil)
+	require.NoError(t, err)
+	otherURI := "quack:127.0.0.1:" + freeTCPPort(t)
+	openQuackMirrorServer(t, ctx, otherPath, otherURI, token)
+	other := open(otherURI)
+	_, err = other.GetTrendsTerms(ctx, filter, terms, "day")
+	require.NoError(t, err)
+	require.NotEmpty(t, reads, "another target needs its own contributions")
+	require.NoError(t, other.Close())
 }
 
 func openQuackMirrorServer(
@@ -380,7 +352,7 @@ func openQuackMirrorServer(
 	_, err = server.ExecContext(ctx, `CALL quack_serve(?, token => ?)`, uri, token)
 	require.NoError(t, err, "start quack server")
 	t.Cleanup(func() {
-		_, stopErr := server.ExecContext(context.Background(), `CALL quack_stop(?)`, uri)
+		_, stopErr := server.ExecContext(context.WithoutCancel(t.Context()), `CALL quack_stop(?)`, uri)
 		require.NoError(t, stopErr, "stop quack server")
 	})
 	return server
@@ -388,7 +360,7 @@ func openQuackMirrorServer(
 
 func freeTCPPort(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err, "allocate free TCP port")
 	defer func() {
 		require.NoError(t, ln.Close(), "close port probe listener")

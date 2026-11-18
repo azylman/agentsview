@@ -1,3 +1,4 @@
+import { untrack } from "svelte";
 import {
   Virtualizer,
   type VirtualizerOptions,
@@ -90,10 +91,23 @@ function createBaseVirtualizer<TScroll extends Element | Window, TItem extends E
     }
     lastMeasureCacheKey = opts.measureCacheKey;
 
+    const getItemKey = opts.getItemKey;
+    const orderChanged =
+      opts.count === instance.options.count &&
+      getItemKey !== undefined &&
+      instance.getVirtualItems().some((item) => item.key !== getItemKey(item.index));
     instance.setOptions(resolvedOpts);
     instance._willUpdate();
+    // A reorder can leave the visible range unchanged, so TanStack won't notify.
+    if (orderChanged) untrack(() => _version++);
 
     postUpdate?.(instance, opts, cacheKeyChanged);
+
+    // setOptions does not notify, and TanStack notifies only when the
+    // rendered index range changes. Without this, a new item count that
+    // keeps the range indexes, or leaves the scroll offset past the new end,
+    // would keep the old rows and total size on screen.
+    untrack(() => _version++);
 
     return () => {
       instance?._willUpdate();
@@ -110,12 +124,12 @@ function createBaseVirtualizer<TScroll extends Element | Window, TItem extends E
 }
 
 function scrollReconcileState(v: Virtualizer<HTMLElement, HTMLElement>) {
-  // Public cancelScroll() arrives in @tanstack/virtual-core 3.18.0; switch to it on upgrade.
+  // TanStack has no public read of the in-flight scroll target.
   return v as unknown as { scrollState: { index: number | null } | null };
 }
 
 export function cancelScrollReconcile(v: Virtualizer<HTMLElement, HTMLElement> | undefined) {
-  if (v) scrollReconcileState(v).scrollState = null;
+  v?.cancelScroll();
 }
 
 export function createVirtualizer(optsFn: () => ElementOpts) {

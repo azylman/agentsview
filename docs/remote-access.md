@@ -132,34 +132,26 @@ connection refusal usually means the daemon is not running, is still bound to
 loopback, or the URL port is wrong; DNS and timeout messages point back to the
 configured `url`.
 
-A bare `agentsview sync` treats offline, unreachable, and timed-out configured
+A bare `agentsview source sync` treats offline, unreachable, and timed-out configured
 HTTP hosts as absent fleet members. It prints a skipped-host progress line,
 continues with local and reachable remote sources, and exits successfully unless
-another error occurs. `agentsview sync --host X` remains strict and reports an
+another error occurs. `agentsview source sync --host X` remains strict and reports an
 unavailable explicitly selected host as an error.
 
-For always-available fleet nodes launched with `agentsview daemon start`, set:
+Fleet nodes launched with `agentsview daemon start` stay available until
+stopped.
 
-```toml
-daemon_idle_timeout = "0s"
-```
-
-That setting controls detached writable daemons, including config-driven and
-`serve --background` launches. Supervised daemons run under systemd, launchd,
-Docker, or a foreground shell never create the idle tracker and already stay
-alive until their supervisor stops them.
-
-Run `agentsview sync` on the collector to sync local sessions and every
+Run `agentsview source sync` on the collector to sync local sessions and every
 configured host. Set `interval` on a `[[remote_hosts]]` entry when a running
 collector daemon should sync that host periodically; omit it or set it to `0s`
-for manual sync only. See [`agentsview sync`](/docs/commands/#agentsview-sync) for
+for manual sync only. See [`agentsview source sync`](/docs/commands/#agentsview-sync) for
 single-host selection and failure behavior.
 
 ## SSH Remote Sync
 
 SSH remote sync collects sessions from a machine you can reach with `ssh`. The
 remote machine needs no AgentsView install and no running daemon. The feature is
-newer than the latest release and is available on `main`.
+available in 0.46.0 and later.
 
 ### Set Up
 
@@ -186,7 +178,7 @@ without asking for a password or passphrase. Check it first:
 ssh -o BatchMode=yes user@devbox.example.com true
 ```
 
-Then run `agentsview sync --host devbox`. A bare `agentsview sync`, the daemon's
+Then run `agentsview source sync --host devbox`. A bare `agentsview source sync`, the daemon's
 periodic `interval` sync, and full rebuilds also include SSH hosts. Sessions get
 the same IDs, machine name, and paths as HTTP hosts. Mirrors, manifests, and
 delta transfers work as described in [Incremental Sync](#incremental-sync).
@@ -248,8 +240,8 @@ to sync from a release build.
 
 ### Offline Hosts
 
-A bare `agentsview sync` skips an SSH host that the network cannot reach, the
-same as an offline HTTP host. `agentsview sync --host devbox` reports it as an
+A bare `agentsview source sync` skips an SSH host that the network cannot reach, the
+same as an offline HTTP host. `agentsview source sync --host devbox` reports it as an
 error. `ssh` must exit with status 255 and print one of these OpenSSH messages:
 
 - `Could not resolve hostname`
@@ -313,15 +305,31 @@ host's syncable source corpus for it.
 1. The collector locks the host mirror and requests a gzip-compressed manifest
    of regular, non-symlink files. Each entry carries its absolute remote path,
    size, and modification time.
-1. The collector walks the mirror and compares file size and modification time
-   at microsecond precision. It schedules missing or changed files for fetch and
-   removes mirror files that disappeared from the manifest. Before changing the
-   mirror, it durably merges those paths into a bounded recovery journal next to
-   the mirror.
-1. The collector requests only missing or changed files. When every manifest
-   file needs fetching, it requests a full archive instead of sending the full
-   file list. Archive transfers prefer Zstandard compression; gzip remains
-   available through HTTP encoding negotiation. Manifests use gzip.
+1. The remote sends manifest entries sorted by mirror path. As each entry
+   arrives, the collector walks the mirror in the same order and compares file
+   size and modification time at microsecond precision, so neither the manifest
+   nor the mirror listing is held in memory. It schedules missing or changed
+   files for fetch and removes mirror files that disappeared from the manifest.
+   Each list stays in memory up to 4 MiB of paths and moves to a temporary file
+   next to the mirror past that. Before changing the mirror, it durably merges
+   those paths into a bounded recovery journal next to the mirror. When more
+   than 8,192 files change, or their paths add up to more than 4 MiB, the
+   journal records one full import instead, and that sync re-reads every
+   session from the host.
+1. The collector requests only missing or changed files, in requests of at
+   most 4 MiB of paths each. When every manifest file needs fetching, it
+   requests a full archive instead of sending the full file list. Archive
+   transfers prefer Zstandard compression; gzip remains available through HTTP
+   encoding negotiation. Manifests use gzip.
+1. For a changed file the mirror already holds, the request also sends the
+   mirror copy's length and a SHA-256 hash of its last 64 KiB. When the file is
+   a JSON Lines (`.jsonl`) transcript, the remote copy is longer, and its bytes
+   before that length end the same way, the remote sends only the bytes past
+   it, and the collector appends them to the mirror copy. Agent transcripts
+   grow by appending, so a long session costs only its new lines. Any other
+   file, such as a SQLite database that rewrites earlier pages as it grows,
+   and every file from a remote that predates this check, arrives whole. An append that fails partway leaves the mirror copy at
+   its old length, so the next sync fetches the file again.
 1. The archive is extracted into the mirror with remote modification times
    preserved. AgentsView classifies the pending journal paths and imports only
    their affected sources. A provider whose exact scope cannot be proven falls
@@ -333,10 +341,11 @@ An explicit full import reparses the complete mirror without forcing unchanged
 bytes across the network. If a rejected delta request requires a full archive,
 the collector still imports only the affected sources.
 
-Sync logs report target resolution, manifest fetch and comparison times, plus
-each archive's encoding, compressed byte count, download time, and extraction
-time. Download time includes waiting for the remote response. The existing
-import log reports planning, processing, and cache persistence times.
+Sync logs report target resolution time and manifest time. The manifest time
+includes the mirror comparison. They also report each archive's encoding,
+compressed byte count, download time, and extraction time. Download time
+includes waiting for the remote response. The existing import log reports
+planning, processing, and cache persistence times.
 
 For a configured full sync that includes local sources, mirror preparation
 finishes before database work begins. Up to four remote hosts prepare at once
@@ -348,7 +357,7 @@ atomic swap. A preparation, parser, batch-write, or FTS failure leaves the
 active archive unchanged.
 
 Remote-only syncs, including
-`agentsview sync --host <configured-http-host> --full`, continue to import into
+`agentsview source sync --host <configured-http-host> --full`, continue to import into
 the active archive and do not use the combined rebuild path.
 
 If no directory-scoped files changed, the collector skips the archive request
@@ -363,6 +372,11 @@ same-mtime extraction cannot be hidden by stale cache state. A deterministic
 parse failure is then retained in the existing error-skip cache, retried on
 replay as a skip, and re-armed only when the remote path changes again. Recovery
 work is bounded; overflow collapses to one conservative full import.
+
+A remote sync requested from a running daemon, such as `agentsview sync` while
+`agentsview serve` runs, belongs to the daemon. If the requesting client
+disconnects or is killed, the daemon stops sending it progress and finishes the
+import. Only daemon shutdown cancels the run.
 
 Windsurf is a special case. Its state database is sanitized into a curated
 export for every transfer, so the raw tree cannot safely participate in the
@@ -428,6 +442,10 @@ carries that version, and successful responses echo it. A missing or mismatched
 request version returns HTTP 426 before targets or archive data are exchanged,
 so upgrade both hosts before syncing again after either side changes protocol.
 
+An HTTP remote on Windows running an older AgentsView can fail a sync with a
+message to upgrade AgentsView on the remote host. The older release lists its
+files in a different order under the same protocol version.
+
 The normal mirror comparison detects interrupted extraction when the resulting
 file size or modification time differs from the manifest, and the next sync
 fetches that file again. It also repairs file-versus-directory conflicts left by
@@ -449,8 +467,10 @@ The remote daemon recomputes its allowed sync targets for each request and
 rejects paths outside them. Manifest walks omit symlinks and special files;
 delta requests must either match an allowed extra file exactly or use an
 absolute path in the same POSIX, drive-letter, or UNC dialect as the allowed
-root. Symlinked roots or intermediate components are refused. Mirror deletions
-and type-conflict cleanup are separately confined to the per-host mirror root.
+root. Symlinked roots or intermediate components are refused. The collector
+rejects a manifest whose entry is larger than 256 KiB, which is well above the
+longest path any supported system allows. Mirror deletions and type-conflict
+cleanup are separately confined to the per-host mirror root.
 
 These checks limit what authenticated sync requests can read, but they do not
 replace network isolation or bearer-token security. Keep the daemon on a private
@@ -458,15 +478,24 @@ network and protect its `auth_token` as described above.
 
 ## SSE Endpoints
 
-The SSE endpoints also accept `?token=<token>` because browser `EventSource`
-cannot set custom headers:
+The live-update streams accept the same `Authorization: Bearer <token>` header
+as every other API call. The bundled web UI always sends the header, including
+for these streams.
+
+For clients built on the browser's native `EventSource`, which cannot set
+headers, the streams also accept the token as a `?token=` query parameter:
 
 ```text
 http://<host>:8080/api/v1/events?token=<token>
 http://<host>:8080/api/v1/sessions/<id>/watch?token=<token>
+http://<host>:8080/api/v1/changes/stream?token=<token>
 ```
 
-Use header-based auth for normal API calls whenever possible.
+A token in the URL can end up in proxy access logs and browser history, so
+send the header whenever your client can. Managed Caddy mode removes the
+`token` parameter from the request URLs it logs. If you run your own reverse
+proxy, filter the parameter out of its access logs. Other API endpoints never
+accept the query parameter.
 
 ## Public URL And Trusted Origins
 
@@ -615,11 +644,16 @@ location.reload()
 
 ### Slow Aggregates Behind A Proxy
 
-API responses have a write deadline; a request that exceeds it returns `503`
+Most API responses have a write deadline; a request that exceeds it returns `503`
 with a `{"error":"request timed out"}` body, and affected dashboard panels show
 "request timed out". The default is 30 seconds, which is comfortable for local
-archives but can be tight for large shared datasets — heatmap, activity, and
-usage summaries scan the full message history.
+archives but can be tight for large shared datasets.
+
+Long-running routes are exempt from this deadline. They include session and
+content search, session statistics, usage summaries, comparisons, and top
+sessions, activity report sessions, Kata status, single-session sync, archive
+maintenance, friction reviews, and conversation export. Cancelling a search
+request stops its search. A reverse proxy may impose its own timeout.
 
 Raise the deadline with `--write-timeout` (a Go duration). The flag is available
 on both the local SQLite server and the PostgreSQL read server:
@@ -629,7 +663,7 @@ on both the local SQLite server and the PostgreSQL read server:
 agentsview serve --write-timeout 120s
 
 # PostgreSQL-backed read server (the multi-tenant / large-dataset case)
-agentsview pg serve --write-timeout 120s
+agentsview replica pg serve --write-timeout 120s
 ```
 
 Set it to `0` to disable the deadline entirely. If aggregates are slow enough to
@@ -735,7 +769,7 @@ Changes that affect bind or auth behavior may require a server restart.
 | `--require-auth`    | `false`     | Require a bearer token for API requests             |
 | `--public-url`      |             | Browser URL, also added to trusted origins             |
 | `--public-origin`   |             | Trusted browser origin (repeatable/comma-separated) |
-| `--write-timeout`   | `30s`       | API response write deadline; `0` disables it        |
+| `--write-timeout`   | `30s`       | API response deadline; long-running routes are exempt; `0` disables it |
 | `--proxy`           |             | Managed proxy mode (`caddy`)                        |
 | `--caddy-bin`       | `caddy`     | Caddy binary path                                   |
 | `--proxy-bind-host` | `127.0.0.1` | Interface for managed proxy                         |

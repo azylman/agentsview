@@ -119,6 +119,8 @@ type IndexSpec struct {
 	// MirrorSchemaVersion versions the mirror's DDL shape and its
 	// document-identity scheme; see prepareMirrorSchema.
 	MirrorSchemaVersion string
+	// UpgradableFrom lists older stamps whose rows can be retained in place.
+	UpgradableFrom []string
 }
 
 // NormalizeIncludeAutomated applies the store's scope capability to a build
@@ -145,13 +147,13 @@ func (s IndexSpec) chunksTable() string      { return s.VectorsPrefix + "_chunks
 func (s IndexSpec) repairQueueTable() string { return s.VectorsPrefix + "_repair_queue" }
 
 // MessageIndexSpec is the conversation-message embedding store. Its table
-// names, metadata keys, and schema version predate IndexSpec and must stay
-// byte-identical so existing vectors.db files open without a reset.
+// names and metadata keys predate IndexSpec.
 //
 // History: "2" added the ordinal_end/subordinate/offsets columns but still
 // held one row per message; "3" switched document identity to run-grouped
 // units (one row per user message or per run of contiguous assistant
-// messages) with no DDL change.
+// messages) with no DDL change; "4" caps assistant runs and upgrades "3"
+// in place.
 func MessageIndexSpec() IndexSpec {
 	return IndexSpec{
 		Name:                   "messages",
@@ -160,7 +162,8 @@ func MessageIndexSpec() IndexSpec {
 		MetaTable:              "vector_meta",
 		VectorsPrefix:          "message_vectors",
 		MirrorDDL:              messageMirrorDDL,
-		MirrorSchemaVersion:    "3",
+		MirrorSchemaVersion:    "4",
+		UpgradableFrom:         []string{"3"},
 	}
 }
 
@@ -185,17 +188,21 @@ func RecallIndexSpec() IndexSpec {
 // but every subsequent Search call on that Index fails with this sentinel
 // until a build recreates the mirror.
 var ErrMirrorVersionMismatch = errors.New(
-	"vector index was built by an incompatible version: run `agentsview embeddings build`")
+	"vector index was built by an incompatible version: run `agentsview index embeddings build`")
 
 // Index wraps vectors.db: agentsview's mirror of embeddable message content
 // plus kit's sqlitevec store, which owns the generation and vec0 tables
 // derived from spec's VectorsPrefix.
 type Index struct {
-	db       *sql.DB
-	store    *sqlitevec.Store[string, string]
-	spec     IndexSpec
-	split    kitvec.SplitOptions
-	readOnly bool
+	db    *sql.DB
+	store *sqlitevec.Store[string, string]
+	// Snapshots use a separate read-only pool: the cgo driver applies
+	// _txlock even when BeginTx requests a read-only transaction.
+	readDB    *sql.DB
+	readStore *sqlitevec.Store[string, string]
+	spec      IndexSpec
+	split     kitvec.SplitOptions
+	readOnly  bool
 
 	// versionMismatch records a read-path Open's version-gate finding: the
 	// mirror was written by a different spec.MirrorSchemaVersion. Write-path
@@ -230,6 +237,12 @@ type GenerationInfo struct {
 // the split behavior and its fingerprint can never drift apart.
 func ChunkOverlap(maxInputChars int) int {
 	return maxInputChars * 15 / 100
+}
+
+// RunMaxRunes caps runs at four inputs. Chunks step by 0.85 * maxInputChars,
+// so a full piece takes about 4.7 chunks, plus the appended message.
+func RunMaxRunes(maxInputChars int) int {
+	return 4 * maxInputChars
 }
 
 // Open opens the message-store index; see OpenSpec.
@@ -330,10 +343,26 @@ CREATE TABLE IF NOT EXISTS `+spec.repairQueueTable()+` (
 		}
 	}
 
+	readDB, readStore := db, store
+	if !readOnly {
+		readDB, err = sql.Open(vectorDriverName, vectorDSN(path, true))
+		if err != nil {
+			db.Close()
+			return nil, err
+		}
+		readStore, err = sqlitevec.New[string, string](ctx, readDB, spec.schema())
+		if err != nil {
+			readDB.Close()
+			db.Close()
+			return nil, err
+		}
+	}
 	overlap := ChunkOverlap(maxInputChars)
 	return &Index{
 		db:              db,
 		store:           store,
+		readDB:          readDB,
+		readStore:       readStore,
 		spec:            spec,
 		split:           kitvec.SplitOptions{MaxRunes: maxInputChars, Overlap: overlap},
 		readOnly:        readOnly,
@@ -410,12 +439,12 @@ SELECT name FROM sqlite_master
 }
 
 // mirrorVersionMismatch reports whether vectors.db's stamped
-// mirror_schema_version differs from spec.MirrorSchemaVersion. An
-// empty/fresh database (no mirror-state table at all) is never a mismatch —
+// mirror_schema_version differs from spec.MirrorSchemaVersion and is absent
+// from spec.UpgradableFrom. An empty/fresh database (no mirror-state table at
+// all) is never a mismatch —
 // there is nothing yet to be incompatible with. Otherwise, a version key
-// that is absent, or holds a different value, while any mirror-state table
-// already exists is a mismatch: that table predates versioning entirely, or
-// was stamped by a different scheme. tables is always returned so a
+// that is absent, or holds an incompatible value, while any mirror-state
+// table already exists is a mismatch. tables is always returned so a
 // write-path caller can drop exactly the set that was inspected.
 func mirrorVersionMismatch(ctx context.Context, db *sql.DB, spec IndexSpec) (mismatch bool, tables []string, err error) {
 	tables, err = mirrorStateTableNames(ctx, db, spec)
@@ -439,7 +468,7 @@ func mirrorVersionMismatch(ctx context.Context, db *sql.DB, spec IndexSpec) (mis
 	if err != nil {
 		return false, nil, fmt.Errorf("reading mirror schema version: %w", err)
 	}
-	return stamped != spec.MirrorSchemaVersion, tables, nil
+	return stamped != spec.MirrorSchemaVersion && !slices.Contains(spec.UpgradableFrom, stamped), tables, nil
 }
 
 // dropMirrorTables drops every named table, resetting vectors.db's mirror
@@ -471,6 +500,9 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
 
 // Close closes the underlying vectors.db connection.
 func (ix *Index) Close() error {
+	if ix.readDB != nil && ix.readDB != ix.db {
+		return errors.Join(ix.readDB.Close(), ix.db.Close())
+	}
 	return ix.db.Close()
 }
 
@@ -684,7 +716,7 @@ func (ix *Index) MissingEmbeddedDocs(
 	if ix.versionMismatch {
 		return 0, ErrMirrorVersionMismatch
 	}
-	snap, err := ix.store.Snapshot(ctx, fingerprint)
+	snap, err := ix.readStore.Snapshot(ctx, fingerprint)
 	if err != nil {
 		return 0, err
 	}

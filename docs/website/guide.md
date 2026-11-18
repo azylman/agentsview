@@ -4,8 +4,8 @@ Your agents already write the raw data. AgentsView turns it into a searchable
 archive, and the archive into answers your agents can use on their next run.
 Nine stops, five minutes.
 
-Updated for [v0.45.0](/docs/changelog/#0450), including Spanish, tool sequences,
-and conversation-memory plugins.
+Updated for [v0.47.0](/docs/changelog/#0470), including the Friction Log, the
+prompt behind any line of code, and one-click search by meaning.
 
 ## 01. Capture every session
 
@@ -13,6 +13,10 @@ The daemon discovers the session directories behind more than 60 agent formats,
 including Claude Code, Codex, Cursor, Copilot, and Gemini, and syncs them into
 one local SQLite archive with full-text indexes. It keeps watching, so the
 archive stays current while you work. [Quick start](/docs/quickstart/).
+
+Sync Claude.ai through Chrome, or enable Codex Cloud on one machine for chats
+that live on OpenAI's servers. Muse Code and fx sessions also join the local
+archive.
 
 ## 02. Browse the full conversation
 
@@ -24,6 +28,10 @@ where they left off. [Usage guide](/docs/usage/).
 Use the opt-in [project workspace](/docs/data/#enable-the-project-workspace) to
 correct project names with folder suggestions, transcript previews, and bulk
 corrections.
+
+Find related work with exact labels and Claude Code pull-request links. Launcher
+links keep independently started workers under their manager and include their
+costs in its total.
 
 ## 03. Monitor the fleet
 
@@ -41,18 +49,22 @@ Git totals for the selected dates.
 Usage reports show recorded tokens and estimated costs, including prompt-cache
 writes and reads. Reports reuse saved archive data; the first request after an
 upgrade or sync may need time to prepare its cache. The CLI answers in the
-terminal (`agentsview usage daily`), the statusline shows today's spend inside
-your editor, and one-shot capture reports recorded usage for a single Claude or
-Codex CI run. Total Input includes prompt-cache reads and writes; Uncached Input
-keeps those tokens separate. Choose Smooth, Lines, or Bars for the cost chart.
-[Token usage and costs](/docs/token-usage/).
+terminal (`agentsview report usage daily`), the statusline shows today's spend
+inside your editor, and one-shot capture reports recorded usage for a single
+Claude or Codex CI run. Total Input includes prompt-cache reads and writes;
+Uncached Input keeps those tokens separate. Choose Smooth, Lines, or Bars for
+the cost chart. [Token usage and costs](/docs/token-usage/).
+
+Select a project, model, or agent in the cost breakdown to narrow the page. Open
+hermes-cron to compare individual jobs. Model aliases combine variants after
+each has been priced.
 
 ## 05. Search by words or by meaning
 
 Press `Ctrl/Cmd+K` to search, then choose a project and date range in the
 palette. Select **All Projects** to widen the search without changing the
-sidebar. Full-text search finds exact words; opt-in semantic and hybrid search
-find related meaning and cite the matching conversation.
+sidebar. Full-text search finds exact words. Turn on search by meaning from the
+palette or Settings to find related ideas and cite the matching conversation.
 [Search controls](/docs/usage/#command-palette) ·
 [Semantic search](/docs/semantic-search/).
 
@@ -64,6 +76,14 @@ and time that cannot be assigned to a phase. Click an activity row to inspect
 its transcript entry. Open the health badge for tool sequences that trace
 errors, retries, switches, and recovery back to recorded calls, without model
 charges. [Session intelligence](/docs/session-intelligence/).
+
+Tool Usage shows empty-result, repeat-call, and recovery rates with links to
+contributing sessions. Choose Analyze tool effectiveness from a session's
+actions menu for a model assessment that cites the calls it judged.
+
+Turn on the [Friction Log](/docs/quality/#friction-log) for a daily review of
+corrections, tool errors, and recurring problems, each linked to its message.
+File recurring problems as Kata issues.
 
 ## 07. Keep what the sessions learned
 
@@ -82,6 +102,11 @@ tried before repeating it. Native memory plugins for Claude Code and Codex
 bundle recall instructions, focused search, and session-start refresh.
 [MCP server](/docs/mcp/) · [Session API](/docs/session-api/).
 
+Read-only MCP tools also expose file edits, tool calls, child sessions, Activity
+reports, tool usage, cost comparisons, and offline guide search. Run
+[`agentsview why file.go:120-140`](/docs/commands/#agentsview-why) to find the
+session and prompt behind a line of code.
+
 ## 09. Extend beyond one machine
 
 Push each machine's archive to PostgreSQL for a merged team view, use ClickHouse
@@ -91,6 +116,11 @@ Hosted raw sync can also parse uploaded sources directly into PostgreSQL without
 a local SQLite archive or a separate push. [PostgreSQL sync](/docs/pg-sync/) ·
 [ClickHouse sync](/docs/clickhouse-sync/) · [DuckDB mirror](/docs/duckdb/) ·
 [Hosted raw sync](/docs/hosted-raw-sync/).
+
+SSH sync fetches sessions from remote Linux and macOS hosts without a manually
+installed daemon. Archive capture and seed import preserve a retired computer's
+history and original files; keep new local sessions in a separate data
+directory.
 
 ## Next
 

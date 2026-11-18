@@ -32,6 +32,44 @@ The current implementation is local and SQLite-only. The CLI provides:
   `recall extract preview` for previewing deterministic session chunks; and
 - `recall import --dry-run` for validating reviewed JSONL candidates.
 
+Use `recall list --updated-since <timestamp>` to list entries changed at or
+after an RFC3339 timestamp, or `--created-since <timestamp>` to list entries
+created at or after it. Both bounds include the boundary millisecond. The list
+filters `updated_since` by `updated_at` and `created_since` by `created_at`.
+When both are set, an entry must meet both bounds.
+
+Time-bounded lists include only entries that still exist; they don't report
+deletions. Consumers that mirror Recall should periodically reconcile their
+copy against a complete listing and remove entries that are no longer present.
+
+A bounded list returns the oldest change first and includes archived entries
+as well as accepted ones, unless you set a status filter. `trusted_only` still
+selects accepted entries. Without a bound, lists show accepted entries, newest
+first. Each entry's `source_run_id` names the extraction generation it came
+from.
+
+Time bounds cannot be combined with a text query. Search uses relevance
+ordering, while a checkpoint walk needs change ordering.
+
+The HTTP list and MCP `list_recall` accept `updated_since` and `created_since`,
+and return `next_cursor` when more entries remain. To follow changes:
+
+1. List with your saved checkpoint as `updated_since`, and pass each
+   `next_cursor` back until a page returns none.
+1. After the last page, save the last entry's `updated_at` as the new
+   checkpoint. Upsert each returned entry by `id`, since a later walk may
+   return an updated version of an entry you already saved.
+1. If a write lands during the walk, the next page fails with "recall corpus
+   changed during pagination" (HTTP 409). Restart from the first page with
+   every bound from the original walk, `updated_since`, `created_since`, or
+   both, and keep the old checkpoint. Restarting from the last entry you
+   received can miss an entry written in the same millisecond. Any Recall
+   entry or evidence write can interrupt a walk, even outside its filters.
+
+An archive from before Recall tracked changes can return a bounded result that
+fits on one page. If more entries match, narrow the bounds or filters to fit
+one page.
+
 The top-level **Recall** page has two tabs:
 
 - **Corpus** is a browser and review surface for distilled entries. It shows
@@ -47,18 +85,6 @@ The top-level **Recall** page has two tabs:
 
 Open Recall from the header or navigate directly to `/recall`. Generated-report
 links use `/recall?tab=generated&insight=<id>`.
-
-From a session's actions menu, **Analyze tool effectiveness** generates a report
-on that one session: which tool calls helped and which wasted turns. Each
-conclusion names the calls it cites, and clicking one shows those calls with a
-link to their message. The session's observed tool sequences and a note on
-anything cut from the model's input follow the conclusions.
-
-The report sends each tool call's input and result to the insight agent, up to
-256 KiB of that text per run, so it costs more tokens than Agent Analysis and
-sends whatever the commands printed, secrets included. When a reply cites a
-message or call the model was never shown, the server asks once more and saves
-nothing if that reply fails too.
 
 ![Recall corpus browser](/docs/assets/generated/screenshots/recall-corpus.png)
 
@@ -81,6 +107,7 @@ retry through a CLI.
 endpoint = "http://127.0.0.1:11434/v1"
 model = "llama3.1"
 api_key_env = "OPENAI_API_KEY" # optional; the value is read at runtime
+# api_key_file = "~/.config/agentsview/insights-key" # or a private file
 # allow_http = true            # required for non-loopback HTTP endpoints
 # default_agent = "codex"      # generator used when no endpoint is configured
 ```
@@ -98,6 +125,30 @@ report under the same endpoint and model.
 
 Generated insights can also be listed, fetched, and generated from the CLI with
 `agentsview insight`; see the [CLI reference](/docs/commands/).
+
+### Tool effectiveness reports
+
+From a session's actions menu, **Analyze tool effectiveness** generates a report
+on that one session: which tool calls helped and which wasted turns. Conclusions
+are marked **Helped**, **Did not help**, or **Unclear**. Each conclusion names
+the calls it cites, and clicking one shows those calls with a link to their
+message. The session's observed tool sequences and a note on anything cut from
+the model's input follow the conclusions.
+
+The report sends each tool call's input and result to the insight agent, up to
+256 KiB of that text per run, so it costs more tokens than Agent Analysis and
+sends whatever the commands printed, secrets included. When a reply cites a
+message or call the model was never shown, the server asks once more and saves
+nothing if that reply fails too.
+
+![Analyze tool effectiveness in the session actions menu](/docs/assets/generated/screenshots/tool-effectiveness-action.png)
+
+![Tool effectiveness assessment with cited calls](/docs/assets/generated/screenshots/tool-effectiveness-report.png)
+
+Saved reports live under **Recall > Generated insights** and have shareable
+local links. If the transcript changes after generation, the report warns that
+its observed facts may differ from what the model assessed. For rates across
+projects and dates, use [Tool Usage](/docs/usage/#tool-usage).
 
 ### Configuring agent binaries
 
@@ -185,7 +236,7 @@ Recall uses the same `[vector]` model and embeddings servers as session semantic
 search, but it has an independent index generation. Build it explicitly with:
 
 ```bash
-agentsview embeddings build --store recall
+agentsview index embeddings build --store recall
 ```
 
 Automatic Recall embedding requires separate consent because accepted entries
@@ -236,6 +287,10 @@ passes, and a periodic backstop revisits sessions whose transcripts changed
 after extraction. Entries produced this way are stored `unreviewed_auto` — they
 remain outside trusted Recall until promoted.
 
+On battery, scheduled model passes wait and resume within about a minute of AC
+power, or at the next daemon start if it exited while waiting. Retraction of
+entries from trashed, automated, or secret-bearing sessions continues on battery.
+
 ```toml
 [recall.extract]
 enabled = true
@@ -265,7 +320,9 @@ Optional keys: `deployment` (labels which serving instance produced the corpus),
 — how long a session must have been ended before extraction),
 `backstop_interval` (default `"1h"`), `failure_backoff` (default `"1h"`),
 `max_window_chars` (default 50000), `max_tokens`, `candidate_findings`
-(`"block"` default, or `"allow"` — see below), per-server `api_key_env`,
+(`"block"` default, or `"allow"` — see below), per-server `api_key_env` or
+`api_key_file` (see
+[Read secrets from files](/docs/configuration/#read-secrets-from-files)),
 per-server `concurrency` (default 1 — see below), a `[recall.extract.prompts]`
 table (`profile`, `dir`), and a `[recall.extract.request]` table (`temperature`,
 `extra_body`).

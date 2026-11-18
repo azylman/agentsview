@@ -13,9 +13,11 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/secrets"
 )
 
 const conversationRevisionKey = "conversation_publication_revision"
@@ -27,12 +29,23 @@ var (
 )
 
 type ConversationExportOptions struct {
+	TextMode   string
 	Checkpoint string
 	Cursor     string
 	Limit      int
+	// ToolSummaries adds a tool_summary change for each session whose tool
+	// calls changed.
+	ToolSummaries bool
+}
+
+// ConversationSession describes the session independently of optional usage summaries.
+type ConversationSession struct {
+	Agent      string `json:"agent"`
+	Automation string `json:"automation"`
 }
 
 type ConversationChange struct {
+	Session   *ConversationSession    `json:"session,omitempty"`
 	Type      string                  `json:"type"`
 	SessionID string                  `json:"session_id"`
 	MessageID string                  `json:"message_id"`
@@ -45,9 +58,12 @@ type ConversationChange struct {
 	Digest    string                  `json:"digest"`
 	TextBytes int64                   `json:"text_bytes"`
 	Project   export.ProjectReference `json:"project"`
+	// ToolSummary is set on a live tool_summary change whose calls are stored.
+	ToolSummary *ConversationToolSummary `json:"tool_summary,omitempty"`
 }
 
 type ConversationExportResult struct {
+	TextMode      string               `json:"text_mode,omitempty"`
 	SchemaVersion int                  `json:"schema_version"`
 	ArchiveID     string               `json:"archive_id"`
 	DatabaseID    string               `json:"database_id"`
@@ -57,30 +73,48 @@ type ConversationExportResult struct {
 }
 
 type ConversationMessageOptions struct {
+	TextMode   string
 	DatabaseID string
 	SessionID  string
 	MessageID  string
 	Revision   string
 	Offset     int64
 	MaxBytes   int
+	// RevealSecrets returns the stored text unchanged. By default every
+	// secret-shaped span is masked as the UI masks it, and offsets index the
+	// masked text.
+	RevealSecrets bool
 }
 
 type ConversationMessage struct {
+	TextMode string `json:"text_mode,omitempty"`
 	ConversationChange
-	SchemaVersion int     `json:"schema_version"`
-	ArchiveID     string  `json:"archive_id"`
-	DatabaseID    string  `json:"database_id"`
-	Offset        int64   `json:"offset"`
-	NextOffset    int64   `json:"next_offset"`
-	Text          *string `json:"text"`
+	SchemaVersion int    `json:"schema_version"`
+	ArchiveID     string `json:"archive_id"`
+	DatabaseID    string `json:"database_id"`
+	Offset        int64  `json:"offset"`
+	NextOffset    int64  `json:"next_offset"`
+	// Redacted reports that secrets were masked, so the text and TextBytes
+	// differ from the stored message the Digest identifies.
+	Redacted bool    `json:"redacted,omitzero"`
+	Text     *string `json:"text"`
 }
 
 type conversationPosition struct {
+	TextMode   string `json:"text_mode,omitempty"`
 	Version    int    `json:"version"`
 	Kind       string `json:"kind"`
 	DatabaseID string `json:"database_id"`
 	After      int64  `json:"after,string"`
 	Through    int64  `json:"through,string"`
+	// Pruned is the tombstone floor when this position was issued.
+	Pruned int64 `json:"pruned,string,omitempty"`
+	// ToolAfter and ToolThrough are this walk's place in the tool journal,
+	// which has its own revisions. A position issued without tool summaries
+	// has neither, so the first walk that asks for them starts from the
+	// beginning of the journal.
+	ToolAfter   int64 `json:"tool_summary_after,string,omitzero"`
+	ToolThrough int64 `json:"tool_summary_through,string,omitzero"`
 }
 
 const conversationChangeColumns = `session_id, message_id, CAST(revision AS TEXT), ordinal,
@@ -96,6 +130,11 @@ func scanConversationChange(row rowScanner, change *ConversationChange) error {
 // snapshot; rows changed beyond the cycle's upper bound appear next cycle.
 func (db *DB) ExportConversationChanges(ctx context.Context, opts ConversationExportOptions) (ConversationExportResult, error) {
 	var result ConversationExportResult
+	mode, err := conversationTextMode(opts.TextMode)
+	if err != nil {
+		return result, err
+	}
+	result.TextMode = mode
 	if opts.Checkpoint != "" && opts.Cursor != "" {
 		return result, errors.New("checkpoint and cursor are mutually exclusive")
 	}
@@ -118,7 +157,7 @@ func (db *DB) ExportConversationChanges(ctx context.Context, opts ConversationEx
 		if err := json.Unmarshal(data, &position, json.RejectUnknownMembers(true)); err != nil {
 			return result, fmt.Errorf("%w: malformed conversation position", ErrInvalidCursor)
 		}
-		if position.Version != 1 || position.Kind != kind || position.DatabaseID == "" || position.After < 0 || position.Through < position.After || kind == "checkpoint" && position.After != position.Through {
+		if position.TextMode != mode || position.Version != 1 || position.Kind != kind || position.DatabaseID == "" || position.After < 0 || position.Through < position.After || kind == "checkpoint" && position.After != position.Through {
 			return result, fmt.Errorf("%w: invalid conversation position", ErrInvalidCursor)
 		}
 	}
@@ -127,8 +166,8 @@ func (db *DB) ExportConversationChanges(ctx context.Context, opts ConversationEx
 	// read-only and builds through the writer owner on
 	// ErrConversationInitializationRequired.
 	if !db.readOnly {
-		var active bool
-		if err := db.getReader().QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM archive_metadata WHERE key=?)`, conversationExportInitializedKey).Scan(&active); err != nil {
+		active, err := db.ConversationExportActive(ctx)
+		if err != nil {
 			return result, err
 		}
 		if !active {
@@ -142,22 +181,39 @@ func (db *DB) ExportConversationChanges(ctx context.Context, opts ConversationEx
 		return result, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := requireConversationTextSchema(ctx, tx, mode); err != nil {
+		return result, err
+	}
 	result.SchemaVersion, result.Changes = 1, []ConversationChange{}
 	result.ArchiveID, result.DatabaseID, err = conversationArchiveIdentity(ctx, tx)
 	if err != nil {
 		return result, err
 	}
+	// After the identity check: a cold archive gains the journal from the
+	// writable open that builds its index.
+	if opts.ToolSummaries {
+		if err := requireConversationToolSchema(ctx, tx); err != nil {
+			return result, err
+		}
+	}
 	var current int64
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM archive_metadata WHERE key = ?), 0)`, conversationRevisionKey).Scan(&current); err != nil {
 		return result, err
 	}
-	if position.DatabaseID != "" && (position.DatabaseID != result.DatabaseID || position.Through > current) {
+	pruned, err := archiveJournalRevision(ctx, tx, conversationPrunedRevisionKey, "conversation pruned")
+	if err != nil {
+		return result, err
+	}
+	// A position issued before the latest pruning that has not read through
+	// its floor may have missed deletions whose tombstones are gone.
+	if position.DatabaseID != "" && (position.DatabaseID != result.DatabaseID || position.Through > current ||
+		position.Pruned < pruned && position.After < pruned) {
 		return result, ErrConversationReconciliationRequired
 	}
 	if opts.Cursor == "" {
 		position.Through = current
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT 'message',`+conversationChangeColumns+`,revision AS publication_revision
+	rows, err := tx.QueryContext(ctx, `SELECT 'message',`+conversationColumnsForMode(mode)+`,revision AS publication_revision
 		FROM conversation_messages WHERE revision > ? AND revision <= ?
 		UNION ALL SELECT 'session',session_id,'',CAST(revision AS TEXT),0,'',NULL,deleted,gap,'',0,revision
 		FROM conversation_session_changes WHERE revision > ? AND revision <= ?
@@ -181,18 +237,50 @@ func (db *DB) ExportConversationChanges(ctx context.Context, opts ConversationEx
 	if more {
 		result.Changes = result.Changes[:opts.Limit]
 	}
-	if err := db.attachConversationProjects(ctx, tx, result.ArchiveID, result.Changes); err != nil {
-		return result, err
-	}
-	position.Version, position.DatabaseID = 1, result.DatabaseID
+	position.Version, position.DatabaseID, position.TextMode, position.Pruned = 1, result.DatabaseID, mode, pruned
 	if more {
-		position.Kind = "cursor"
 		position.After, err = strconv.ParseInt(result.Changes[len(result.Changes)-1].Revision, 10, 64)
 		if err != nil {
 			return result, err
 		}
 	} else {
-		position.Kind, position.After = "checkpoint", position.Through
+		position.After = position.Through
+	}
+	if !opts.ToolSummaries {
+		position.ToolAfter, position.ToolThrough = 0, 0
+	} else {
+		// A walk that starts asking, or starts over, reads the journal through
+		// its current head.
+		if opts.Cursor == "" || position.ToolThrough == 0 {
+			position.ToolThrough, err = archiveJournalRevision(ctx, tx, conversationToolRevisionKey, "conversation tool")
+			if err != nil {
+				return result, err
+			}
+		}
+		// Summaries follow the walk's message and session changes.
+		if !more {
+			summaries, remaining, err := conversationToolChangesTx(ctx, tx, position.ToolAfter, position.ToolThrough, opts.Limit-len(result.Changes))
+			if err != nil {
+				return result, err
+			}
+			if len(summaries) > 0 {
+				position.ToolAfter, err = strconv.ParseInt(summaries[len(summaries)-1].Revision, 10, 64)
+				if err != nil {
+					return result, err
+				}
+			}
+			result.Changes, more = append(result.Changes, summaries...), remaining
+		}
+	}
+	if err := db.attachConversationMetadata(ctx, tx, result.ArchiveID, result.Changes, mode); err != nil {
+		return result, err
+	}
+	if err := attachConversationToolSummaries(ctx, tx, result.Changes, time.Now().UTC()); err != nil {
+		return result, err
+	}
+	position.Kind = "checkpoint"
+	if more {
+		position.Kind = "cursor"
 	}
 	data, err := json.Marshal(position)
 	if err != nil {
@@ -238,6 +326,11 @@ func conversationArchiveIdentity(ctx context.Context, tx *sql.Tx) (string, strin
 // Project evidence and the body are resolved in the same archive snapshot.
 func (db *DB) GetConversationMessage(ctx context.Context, opts ConversationMessageOptions) (ConversationMessage, error) {
 	var result ConversationMessage
+	mode, err := conversationTextMode(opts.TextMode)
+	if err != nil {
+		return result, err
+	}
+	result.TextMode = mode
 	if db.usageOnlyStorage() {
 		return result, fmt.Errorf("%w: conversation text is unavailable under archive_content=usage", ErrArchiveContentExcluded)
 	}
@@ -255,6 +348,9 @@ func (db *DB) GetConversationMessage(ctx context.Context, opts ConversationMessa
 		return result, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := requireConversationTextSchema(ctx, tx, mode); err != nil {
+		return result, err
+	}
 	result.ArchiveID, result.DatabaseID, err = conversationArchiveIdentity(ctx, tx)
 	if err != nil {
 		return result, err
@@ -263,26 +359,34 @@ func (db *DB) GetConversationMessage(ctx context.Context, opts ConversationMessa
 		return ConversationMessage{}, ErrConversationReconciliationRequired
 	}
 	result.SchemaVersion, result.Type = 1, "message"
-	err = scanConversationChange(tx.QueryRowContext(ctx, `SELECT `+conversationChangeColumns+` FROM conversation_messages WHERE session_id = ? AND message_id = ?`, opts.SessionID, opts.MessageID), &result.ConversationChange)
+	err = scanConversationChange(tx.QueryRowContext(ctx, `SELECT `+conversationColumnsForMode(mode)+` FROM conversation_messages WHERE session_id = ? AND message_id = ?`, opts.SessionID, opts.MessageID), &result.ConversationChange)
+	if errors.Is(err, sql.ErrNoRows) {
+		// A revision at or below the pruned floor was listed, then removed and
+		// pruned; report it as superseded, as its tombstone would have.
+		pruned, perr := archiveJournalRevision(ctx, tx, conversationPrunedRevisionKey, "conversation pruned")
+		if perr != nil {
+			return result, perr
+		}
+		if revision, perr := strconv.ParseInt(opts.Revision, 10, 64); perr == nil && revision > 0 && revision <= pruned {
+			return ConversationMessage{}, ErrConversationRevisionChanged
+		}
+	}
 	if err != nil {
 		return result, err
 	}
 	if result.Deleted || result.Revision != opts.Revision {
 		return ConversationMessage{}, ErrConversationRevisionChanged
 	}
-	if opts.Offset > result.TextBytes {
-		return ConversationMessage{}, errors.New("offset exceeds message text length")
-	}
 	changes := []ConversationChange{result.ConversationChange}
-	if err := db.attachConversationProjects(ctx, tx, result.ArchiveID, changes); err != nil {
+	if err := db.attachConversationMetadata(ctx, tx, result.ArchiveID, changes, mode); err != nil {
 		return ConversationMessage{}, err
 	}
-	result.Project = changes[0].Project
+	result.Project, result.Session = changes[0].Project, changes[0].Session
 	result.Offset, result.NextOffset = opts.Offset, opts.Offset
 	if result.Digest != "" {
 		// The projection holds the digest; the archived message holds the text.
 		var content string
-		err := tx.QueryRowContext(ctx, `SELECT m.content FROM conversation_messages c JOIN messages m ON m.session_id = c.session_id AND m.ordinal = c.ordinal
+		err := tx.QueryRowContext(ctx, `SELECT `+conversationBodyColumn(mode)+` FROM conversation_messages c JOIN messages m ON m.session_id = c.session_id AND m.ordinal = c.ordinal
 		 WHERE c.session_id = ? AND c.message_id = ?`, opts.SessionID, opts.MessageID).Scan(&content)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ConversationMessage{}, ErrConversationRevisionChanged
@@ -293,6 +397,18 @@ func (db *DB) GetConversationMessage(ctx context.Context, opts ConversationMessa
 		if sum := sha256.Sum256([]byte(text)); hex.EncodeToString(sum[:]) != result.Digest {
 			return ConversationMessage{}, ErrConversationRevisionChanged
 		}
+		if !opts.RevealSecrets {
+			// Mask the whole message before chunking so a secret that spans
+			// a chunk boundary is still recognized and every chunk indexes
+			// the same masked text.
+			if masked := secrets.Redact(text); masked != text {
+				text, result.Redacted = masked, true
+				result.TextBytes = int64(len(text))
+			}
+		}
+		if opts.Offset > result.TextBytes {
+			return ConversationMessage{}, errors.New("offset exceeds message text length")
+		}
 		chunk := text[opts.Offset : opts.Offset+min(int64(len(text))-opts.Offset, int64(opts.MaxBytes))]
 		if len(chunk) > 0 && !utf8.RuneStart(chunk[0]) {
 			return ConversationMessage{}, errors.New("offset is not a UTF-8 boundary")
@@ -302,6 +418,8 @@ func (db *DB) GetConversationMessage(ctx context.Context, opts ConversationMessa
 		}
 		// Clone so a small chunk does not pin the whole message in memory.
 		result.Text, result.NextOffset = new(strings.Clone(chunk)), opts.Offset+int64(len(chunk))
+	} else if opts.Offset > result.TextBytes {
+		return ConversationMessage{}, errors.New("offset exceeds message text length")
 	}
 	if err := tx.Commit(); err != nil {
 		return ConversationMessage{}, err
@@ -309,7 +427,7 @@ func (db *DB) GetConversationMessage(ctx context.Context, opts ConversationMessa
 	return result, nil
 }
 
-func (db *DB) attachConversationProjects(ctx context.Context, tx *sql.Tx, archiveID string, changes []ConversationChange) error {
+func (db *DB) attachConversationMetadata(ctx context.Context, tx *sql.Tx, archiveID string, changes []ConversationChange, mode string) error {
 	if len(changes) == 0 {
 		return nil
 	}
@@ -325,6 +443,11 @@ func (db *DB) attachConversationProjects(ctx context.Context, tx *sql.Tx, archiv
 	snapshots, err := db.listSessionProjectIdentitySnapshotsFrom(ctx, tx, ids)
 	if err != nil {
 		return err
+	}
+	if mode == "visible" {
+		if err := attachConversationSessions(ctx, tx, changes); err != nil {
+			return err
+		}
 	}
 	salt, err := sessionExportMetadataValue(ctx, tx, archiveMetadataArchiveSaltKey, ErrArchiveSaltMissing, "archive salt")
 	if err != nil {
@@ -352,14 +475,17 @@ func (db *DB) attachConversationProjects(ctx context.Context, tx *sql.Tx, archiv
 
 type conversationRow struct {
 	ConversationChange
-	sourceID string
-	body     *string
+	sourceID         string
+	body             *string
+	visibleDigest    string
+	visibleTextBytes int64
+	visibleGap       string
 }
 
 // conversationRowsFromTx returns the live projection rows at or after
 // fromOrdinal.
 func conversationRowsFromTx(tx transactionQueries, sessionID string, fromOrdinal int) ([]conversationRow, error) {
-	rows, err := tx.Query(`SELECT `+conversationChangeColumns+`, source_id FROM conversation_messages WHERE session_id = ? AND removed = 0 AND ordinal >= ? ORDER BY ordinal`, sessionID, fromOrdinal)
+	rows, err := tx.Query(`SELECT `+conversationChangeColumns+`, source_id,visible_digest,visible_text_bytes,visible_gap FROM conversation_messages WHERE session_id = ? AND removed = 0 AND ordinal >= ? ORDER BY ordinal`, sessionID, fromOrdinal)
 	if err != nil {
 		return nil, err
 	}
@@ -367,7 +493,7 @@ func conversationRowsFromTx(tx transactionQueries, sessionID string, fromOrdinal
 	var result []conversationRow
 	for rows.Next() {
 		var row conversationRow
-		if err := rows.Scan(&row.SessionID, &row.MessageID, &row.Revision, &row.Ordinal, &row.Role, &row.Timestamp, &row.Deleted, &row.Gap, &row.Digest, &row.TextBytes, &row.sourceID); err != nil {
+		if err := rows.Scan(&row.SessionID, &row.MessageID, &row.Revision, &row.Ordinal, &row.Role, &row.Timestamp, &row.Deleted, &row.Gap, &row.Digest, &row.TextBytes, &row.sourceID, &row.visibleDigest, &row.visibleTextBytes, &row.visibleGap); err != nil {
 			return nil, err
 		}
 		result = append(result, row)
@@ -380,6 +506,16 @@ func conversationRowFromMessage(m Message) (conversationRow, bool) {
 		return conversationRow{}, false
 	}
 	row := conversationRow{Type: "message", SessionID: m.SessionID, Ordinal: m.Ordinal, Role: m.Role, Timestamp: optionalStringPtr(m.Timestamp), sourceID: m.SourceUUID}
+	switch {
+	case m.DialogueText == nil:
+		row.visibleGap = "visible_text_unavailable"
+	case *m.DialogueText == "":
+		row.visibleGap = "no_visible_text"
+	default:
+		visible := SanitizeUTF8(*m.DialogueText)
+		sum := sha256.Sum256([]byte(visible))
+		row.visibleDigest, row.visibleTextBytes = hex.EncodeToString(sum[:]), int64(len(visible))
+	}
 	if m.Content == "" {
 		row.Gap = "visible_text_unavailable"
 	} else {
@@ -458,9 +594,21 @@ func projectConversationMessagesTx(tx transactionQueries, sessionID string, msgs
 	}
 	equal := replace && len(old) == len(incoming)
 	for i := range incoming {
-		if equal && !conversationRowsEqual(old[i], incoming[i]) {
-			equal = false
+		if !equal || conversationRowsEqual(old[i], incoming[i]) {
+			continue
 		}
+		if !conversationRowGainsSourceID(old[i], incoming[i], counts) {
+			equal = false
+			continue
+		}
+		// A gained ID already held by a kept row or a tombstone needs the
+		// native-identity reconciliation below.
+		var held bool
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM conversation_messages WHERE session_id=? AND source_id=?)`,
+			sessionID, incoming[i].sourceID).Scan(&held); err != nil {
+			return err
+		}
+		equal = !held
 	}
 	// Tombstones are absent from old, so only the table can prove a session is new.
 	fresh := len(old) == 0
@@ -475,8 +623,10 @@ func projectConversationMessagesTx(tx transactionQueries, sessionID string, msgs
 		if equal {
 			row.MessageID = old[i].MessageID
 			// Identity gaps survive an unchanged projection; policy gaps must
-			// reflect this write even when stored text is still absent.
-			if old[i].Gap != "archive_content_excluded" {
+			// reflect this write even when stored text is still absent. A row
+			// that gains its native ID no longer lacks one.
+			gainedSourceID := old[i].Gap == "identity_unavailable" && row.sourceID != ""
+			if old[i].Gap != "archive_content_excluded" && !gainedSourceID {
 				row.Gap = old[i].Gap
 			}
 		} else if row.sourceID != "" && fresh {
@@ -540,12 +690,24 @@ func projectConversationMessagesTx(tx transactionQueries, sessionID string, msgs
 	return putConversationRowsTx(tx, incoming, fresh)
 }
 
+// conversationRowGainsSourceID reports whether incoming is the stored row
+// with a native source ID it lacked before, unique within the projection.
+// Every other projected field must match, so the unchanged projection still
+// proves the identity.
+func conversationRowGainsSourceID(old, incoming conversationRow, counts map[string]int) bool {
+	if old.sourceID != "" || incoming.sourceID == "" || counts[incoming.sourceID] != 1 {
+		return false
+	}
+	old.sourceID = incoming.sourceID
+	return conversationRowsEqual(old, incoming)
+}
+
 func conversationRowsEqual(a, b conversationRow) bool {
 	sameTime := a.Timestamp == nil && b.Timestamp == nil || a.Timestamp != nil && b.Timestamp != nil && *a.Timestamp == *b.Timestamp
 	return a.Ordinal == b.Ordinal && a.Role == b.Role && sameTime && a.sourceID == b.sourceID && a.Digest == b.Digest
 }
 
-const conversationRowsPerStmt = 35 // 12 params per row
+const conversationRowsPerStmt = 35 // 15 params per row
 
 // putConversationRowsTx upserts rows in multi-row statements. A fresh session
 // takes its revisions from one counter reservation instead of the insert
@@ -557,8 +719,8 @@ func putConversationRowsTx(tx transactionQueries, rows []conversationRow, fresh 
 	}
 	var revision int64
 	if fresh {
-		if err := tx.QueryRow(`INSERT INTO archive_metadata(key,value) VALUES(?,CAST(? AS TEXT))
-		 ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+CAST(excluded.value AS INTEGER) AS TEXT) RETURNING CAST(value AS INTEGER)`, conversationRevisionKey, len(rows)).Scan(&revision); err != nil {
+		if err := tx.QueryRow(`INSERT INTO archive_metadata(key,value) VALUES(?,?)
+		 ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+CAST(excluded.value AS INTEGER) RETURNING CAST(value AS INTEGER)`, conversationRevisionKey, len(rows)).Scan(&revision); err != nil {
 			return err
 		}
 		revision -= int64(len(rows))
@@ -566,23 +728,25 @@ func putConversationRowsTx(tx transactionQueries, rows []conversationRow, fresh 
 	for start := 0; start < len(rows); start += conversationRowsPerStmt {
 		chunk := rows[start:min(start+conversationRowsPerStmt, len(rows))]
 		var sb strings.Builder
-		sb.WriteString(`INSERT INTO conversation_messages (session_id,message_id,ordinal,role,timestamp,source_id,body,digest,text_bytes,gap,deleted,revision) VALUES `)
-		args := make([]any, 0, len(chunk)*12)
+		sb.WriteString(`INSERT INTO conversation_messages (session_id,message_id,ordinal,role,timestamp,source_id,body,digest,text_bytes,gap,visible_digest,visible_text_bytes,visible_gap,deleted,revision) VALUES `)
+		args := make([]any, 0, len(chunk)*15)
 		for i, row := range chunk {
 			if i > 0 {
 				sb.WriteByte(',')
 			}
-			sb.WriteString(`(?,?,?,?,COALESCE(?,''),?,?,?,?,?,COALESCE((SELECT deleted_at IS NOT NULL FROM sessions WHERE id = ?),0),?)`)
+			sb.WriteString(`(?,?,?,?,COALESCE(?,''),?,?,?,?,?,?,?,?,COALESCE((SELECT deleted_at IS NOT NULL FROM sessions WHERE id = ?),0),?)`)
 			var rev int64
 			if fresh {
 				rev = revision + int64(start+i) + 1
 			}
 			// Text stays in messages; a NULL body also retires any copy an older version stored.
-			args = append(args, row.SessionID, row.MessageID, row.Ordinal, row.Role, row.Timestamp, row.sourceID, nil, row.Digest, row.TextBytes, row.Gap, row.SessionID, rev)
+			args = append(args, row.SessionID, row.MessageID, row.Ordinal, row.Role, row.Timestamp, row.sourceID, nil, row.Digest, row.TextBytes, row.Gap, row.visibleDigest, row.visibleTextBytes, row.visibleGap, row.SessionID, rev)
 		}
 		sb.WriteString(` ON CONFLICT(session_id,message_id) DO UPDATE SET ordinal=excluded.ordinal,role=excluded.role,timestamp=excluded.timestamp,source_id=excluded.source_id,
-		body=NULL,digest=excluded.digest,text_bytes=excluded.text_bytes,gap=excluded.gap,deleted=excluded.deleted,removed=0
+		body=NULL,digest=excluded.digest,text_bytes=excluded.text_bytes,gap=excluded.gap,
+		visible_digest=excluded.visible_digest,visible_text_bytes=excluded.visible_text_bytes,visible_gap=excluded.visible_gap,deleted=excluded.deleted,removed=0
 		WHERE ordinal IS NOT excluded.ordinal OR role IS NOT excluded.role OR timestamp IS NOT excluded.timestamp OR source_id IS NOT excluded.source_id
+		OR visible_digest IS NOT excluded.visible_digest OR visible_text_bytes IS NOT excluded.visible_text_bytes OR visible_gap IS NOT excluded.visible_gap
 		OR digest IS NOT excluded.digest OR text_bytes IS NOT excluded.text_bytes OR gap IS NOT excluded.gap OR deleted IS NOT excluded.deleted OR removed != 0`)
 		if _, err := tx.Exec(sb.String(), args...); err != nil {
 			return err
@@ -601,7 +765,7 @@ func putConversationSessionChangeTx(tx transactionQueries, sessionID, gap string
 	}
 	var revision int64
 	if err := tx.QueryRow(`INSERT INTO archive_metadata(key,value) VALUES(?,'1')
-	 ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) RETURNING CAST(value AS INTEGER)`, conversationRevisionKey).Scan(&revision); err != nil {
+	 ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1 RETURNING CAST(value AS INTEGER)`, conversationRevisionKey).Scan(&revision); err != nil {
 		return err
 	}
 	_, err := tx.Exec(`INSERT INTO conversation_session_changes(session_id,revision,gap,deleted) VALUES(?,?,?,?)
@@ -610,7 +774,7 @@ func putConversationSessionChangeTx(tx transactionQueries, sessionID, gap string
 }
 
 func clearUsageOnlyConversationTx(tx transactionQueries, sessionID string) error {
-	if _, err := tx.Exec(`UPDATE conversation_messages SET body=NULL,digest='',text_bytes=0,gap='archive_content_excluded' WHERE session_id=? AND removed=0`, sessionID); err != nil {
+	if _, err := tx.Exec(`UPDATE conversation_messages SET body=NULL,digest='',text_bytes=0,gap='archive_content_excluded',visible_digest='',visible_text_bytes=0,visible_gap='archive_content_excluded' WHERE session_id=? AND removed=0`, sessionID); err != nil {
 		return err
 	}
 	var deleted bool

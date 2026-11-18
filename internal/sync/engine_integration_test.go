@@ -25,10 +25,12 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/friction"
 	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/testjsonl"
+	"go.kenn.io/docbank/document/ocr"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
@@ -1438,6 +1440,57 @@ func TestWatcherOverflowReverifiesSameStatOpenCodeStorage(t *testing.T) {
 	assert.True(t, result.Complete)
 	assert.Equal(t, 1, result.Metrics.MaxRehydratedSources,
 		"overflow recovery must reparse event-sensitive storage sessions")
+	assertMessageContent(t, env.db, sessionID, "modified prompt")
+}
+
+// TestNativeDropTrustRevocationReverifiesSameStatOpenCodeStorage covers the
+// per-root reconciliation that follows a native FSEvents drop. It does not
+// clear archive-wide caches the way lost-events recovery does, so on its own
+// it trusts a storage session whose child was rewritten with the same size and
+// mtime. Revoking event-dependent trust first, as the watcher does after a
+// drop, must make that same scoped reconciliation re-read the session.
+func TestNativeDropTrustRevocationReverifiesSameStatOpenCodeStorage(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentOpenCode)
+	storage := createOpenCodeStorageFixture(t, env.opencodeDir)
+	storage.addSession(
+		t, "proj", "drop-same-stat",
+		"/home/user/code/opencode-app", "Drop Guard",
+		1779012000000, 1779012030000,
+	)
+	storage.addMessage(
+		t, "drop-same-stat", "msg-user", "user",
+		1779012000000, nil,
+	)
+	partPath := storage.addTextPart(
+		t, "drop-same-stat", "msg-user", "part-user",
+		"original prompt", 1779012000000,
+	)
+
+	stats := env.engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted)
+	require.Equal(t, 1, stats.Synced)
+	const sessionID = "opencode:drop-same-stat"
+	assertMessageContent(t, env.db, sessionID, "original prompt")
+	partInfo, err := os.Stat(partPath)
+	require.NoError(t, err)
+
+	storage.addTextPart(
+		t, "drop-same-stat", "msg-user", "part-user",
+		"modified prompt", 1779012000000,
+	)
+	require.NoError(t, os.Chtimes(partPath, partInfo.ModTime(), partInfo.ModTime()))
+	rewrittenInfo, err := os.Stat(partPath)
+	require.NoError(t, err)
+	require.Equal(t, partInfo.Size(), rewrittenInfo.Size())
+	require.Equal(t, partInfo.ModTime(), rewrittenInfo.ModTime())
+
+	roots := []string{env.opencodeDir}
+	require.NoError(t, env.engine.ReconcileWatchRoots(t.Context(), roots, false))
+	assertMessageContent(t, env.db, sessionID, "original prompt")
+
+	env.engine.InvalidateEventDependentTrust()
+	require.NoError(t, env.engine.ReconcileWatchRoots(t.Context(), roots, false))
+	assert.True(t, env.engine.LastReconciliationResult().Complete)
 	assertMessageContent(t, env.db, sessionID, "modified prompt")
 }
 
@@ -4046,7 +4099,7 @@ func TestRunExclusiveSerializesWorktreeReclassification(t *testing.T) {
 	select {
 	case applyErr := <-applyDone:
 		require.Failf(t, "apply overlapped exclusive work", "error: %v", applyErr)
-	case <-time.After(25 * time.Millisecond): //nolint:kennlint // absence check; the held exclusive work keeps the apply waiting
+	case <-time.After(25 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check; the held exclusive work keeps the apply waiting
 	}
 	close(release)
 	require.NoError(t, <-firstDone)
@@ -6020,17 +6073,6 @@ func TestSyncPathsClaude(t *testing.T) {
 
 	assertSessionMessageCount(t, env.db, "paths-test", 2)
 	assertSessionMessageCount(t, env.db, "paths-untouched", 1)
-}
-
-func TestSyncPathsIgnoresNonSessionFiles(t *testing.T) {
-	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
-
-	// SyncPaths with non-session paths: no panic, no error
-	env.engine.SyncPaths([]string{
-		filepath.Join(env.claudeDir, "some-dir"),
-		filepath.Join(env.claudeDir, "proj", "README.md"),
-		"/tmp/random-file.txt",
-	})
 }
 
 func TestSyncPathsCodex(t *testing.T) {
@@ -10584,7 +10626,7 @@ func TestSyncEngineConcurrentSerialization(t *testing.T) {
 		require.FailNow(t,
 			"ResyncAll entered while SyncAll held mutex",
 		)
-	case <-time.After(50 * time.Millisecond): //nolint:kennlint // absence check; the held SyncAll mutex keeps ResyncAll out
+	case <-time.After(50 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check; the held SyncAll mutex keeps ResyncAll out
 		// Expected: ResyncAll is blocked.
 	}
 
@@ -12908,10 +12950,7 @@ func TestPiSessionIntegration(t *testing.T) {
 
 	// Use the existing pi session fixture from the parser testdata.
 	// The fixture has id="pi-test-session-uuid".
-	_, callerFile, _, _ := runtime.Caller(0)
-	fixtureDir := filepath.Join(
-		filepath.Dir(callerFile), "..", "parser", "testdata", "pi",
-	)
+	fixtureDir := filepath.Join("..", "parser", "testdata", "pi")
 	fixtureContent, err := os.ReadFile(
 		filepath.Join(fixtureDir, "session.jsonl"),
 	)
@@ -15931,7 +15970,7 @@ func TestResyncAllCancelledPreservesOriginalDB(t *testing.T) {
 	stats := env.engine.ResyncAll(ctx, nil)
 
 	require.True(t, stats.Aborted, "expected ResyncAll to report Aborted")
-	assert.Equal(t, []string{"resync aborted: 0 synced, 0 failed"}, stats.Warnings)
+	assert.Equal(t, []string{"resync aborted: 0 synced, 0 failed: canceled: context canceled"}, stats.Warnings)
 	assert.Equal(t, stats, env.engine.LastSyncStats(),
 		"legacy LastSyncStats must match the returned cancellation result")
 
@@ -18109,6 +18148,106 @@ func TestSyncAllPreservesUnprovenClaudeMissingRows(t *testing.T) {
 			assert.False(t, deletedAt.Valid,
 				"missing row without both legacy and fork evidence must survive")
 			assert.False(t, cause.Valid, "preserved row must not gain a cause")
+		})
+	}
+}
+
+func TestResyncAllPreservesFrictionDigests(t *testing.T) {
+	env := setupTestEnv(t)
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "Hello").
+		AddClaudeAssistant(tsEarlyS5, "Hi there!").
+		String()
+	env.writeClaudeSession(t, "test-proj", "friction-test.jsonl", content)
+	env.engine.SyncAll(t.Context(), nil)
+	before, err := env.db.FrictionSubjectsForDate(t.Context(), "2024-01-01", time.UTC, false)
+	require.NoError(t, err)
+	require.Len(t, before, 1, "fixture session must be eligible before the digest")
+	assert.Equal(t, "friction-test", before[0].SubjectID)
+
+	require.NoError(t, env.db.SaveFrictionDigest(t.Context(), db.FrictionDigest{
+		Date: "2024-01-01", Timezone: "UTC", RulesVersion: "friction-v1",
+		BuiltAt: time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC), Revision: 1,
+		SnapshotJSON: []byte("{}"), SummaryJSON: []byte("{}\n"),
+		Markdown: []byte("# Friction Log — 2024-01-01\n"), MarkdownSHA256: "x", RunID: "r",
+	}, []db.FrictionDigestSubject{{SubjectID: "friction-test", Date: "2024-01-01", SubjectKind: friction.SubjectSession}}, nil))
+
+	stats := env.engine.ResyncAll(t.Context(), nil)
+	require.NotZero(t, stats.Synced)
+
+	got, err := env.db.GetFrictionDigest(t.Context(), "2024-01-01")
+	require.NoError(t, err)
+	require.NotNil(t, got, "digest must survive a full resync")
+	assert.Equal(t, "# Friction Log — 2024-01-01\n", string(got.Markdown))
+	subjects, err := env.db.FrictionSubjectsForDate(t.Context(), "2024-01-01", time.UTC, false)
+	require.NoError(t, err)
+	assert.Empty(t, subjects, "membership survives, so the session is not re-reviewed")
+}
+
+func TestResyncAllUsageOnlyDropsFrictionDigestText(t *testing.T) {
+	env := setupTestEnv(t)
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "private prompt").
+		AddClaudeAssistant(tsEarlyS5, "private reply").
+		String()
+	env.writeClaudeSession(t, "test-proj", "friction-private.jsonl", content)
+	require.Equal(t, 1, env.engine.SyncAll(t.Context(), nil).Synced)
+	require.NoError(t, env.db.SaveFrictionDigest(t.Context(), db.FrictionDigest{
+		Date: "2024-01-01", Timezone: "UTC", RulesVersion: "friction-v1",
+		BuiltAt: time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC), Revision: 1,
+		SnapshotJSON: []byte(`{"prompt":"private prompt"}`), SummaryJSON: []byte("{}"),
+		Markdown: []byte("private reply"), MarkdownSHA256: "x", RunID: "r",
+	}, nil, nil))
+
+	env.engine.Close()
+	env.db.SetArchiveContent(config.ArchiveContentUsage)
+	usageEngine := sync.NewEngine(t.Context(), env.db, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {env.claudeDir}},
+		Machine:   "local", ArchiveContent: config.ArchiveContentUsage,
+	})
+	t.Cleanup(usageEngine.Close)
+	stats := usageEngine.ResyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted, "resync aborted: %v", stats.Warnings)
+	got, err := env.db.GetFrictionDigest(t.Context(), "2024-01-01")
+	require.NoError(t, err)
+	assert.Nil(t, got, "usage-only archive must not retain digest text")
+}
+
+func TestImageTextSurvivesFullResync(t *testing.T) {
+	for _, mode := range []string{"full", "transcripts"} {
+		t.Run(mode, func(t *testing.T) {
+			env := setupSingleAgentTestEnv(t, parser.AgentClaude)
+			ctx := t.Context()
+			env.writeClaudeSession(t, "test-proj", "present.jsonl", testjsonl.NewSessionBuilder().AddClaudeUser(tsEarly, "hello").AddClaudeAssistant(tsEarlyS5, "answer").String())
+			require.Equal(t, 1, env.engine.SyncAll(ctx, nil).Synced)
+			if mode == "full" {
+				content := `[{"type":"input_image","image_url":"data:image/png;base64,AAEC"}]`
+				require.NoError(t, env.db.UpsertSession(ctx, db.Session{ID: "orphan-image", Project: "demo", Agent: "claude", MessageCount: 1}))
+				require.NoError(t, env.db.InsertMessages(ctx, []db.Message{{SessionID: "orphan-image", Role: "assistant", Content: "answer", ToolCalls: []db.ToolCall{{ToolName: "Read", ResultContent: content}}}}))
+				identity, err := ocr.NewIdentity("test", "model", "revision")
+				require.NoError(t, err)
+				require.NoError(t, env.db.BackfillImageTextOccurrences(ctx))
+				require.NoError(t, env.db.SaveImageText(ctx, db.RetainedToolResultImages(content)[0].SHA256, identity, "invoice 42", false))
+			}
+			engine := env.engine
+			if mode == "transcripts" {
+				env.engine.Close()
+				env.db.SetArchiveContent(config.ArchiveContentTranscripts)
+				engine = sync.NewEngine(ctx, env.db, sync.EngineConfig{AgentDirs: map[parser.AgentType][]string{parser.AgentClaude: {env.claudeDir}}, Machine: "local", ArchiveContent: config.ArchiveContentTranscripts})
+				t.Cleanup(engine.Close)
+			}
+			stats := engine.ResyncAll(ctx, nil)
+			require.False(t, stats.Aborted, "%v", stats.Warnings)
+			require.Empty(t, stats.Warnings)
+			if mode == "full" {
+				var count int
+				require.NoError(t, env.db.Reader().QueryRow(ctx, `SELECT count(*) FROM image_text_cache WHERE text='invoice 42'`).Scan(&count))
+				require.Equal(t, 1, count)
+				after, err := env.db.Search(ctx, db.SearchFilter{Query: "invoice"})
+				require.NoError(t, err)
+				require.Len(t, after.Results, 1)
+				require.Equal(t, "orphan-image", after.Results[0].SessionID)
+			}
 		})
 	}
 }

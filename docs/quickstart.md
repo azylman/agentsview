@@ -3,6 +3,9 @@ title: Quick Start
 description: Get AgentsView running in under a minute
 ---
 
+CLI examples use the commands from 0.47.0 and later. For older releases, use
+the legacy names in the [command migration](commands.md#command-migration).
+
 ## Install
 
 ### Desktop App
@@ -95,9 +98,9 @@ The installer detects your OS and architecture, downloads the latest release
 from GitHub Releases, verifies the SHA-256 checksum, and installs the binary.
 
 On macOS and Linux, it installs to `/usr/local/bin` when that directory is
-writable, or `~/.local/bin` otherwise. Follow the installer's `PATH` instructions
-and run `command -v agentsview` to check which binary your shell uses. When
-the standalone CLI and bundled CLI use different directories, put the
+writable, or `~/.local/bin` otherwise. Follow the installer's `PATH`
+instructions and run `command -v agentsview` to check which binary your shell
+uses. When the standalone CLI and bundled CLI use different directories, put the
 standalone install directory first in `PATH` to select it.
 
 !!! note
@@ -109,7 +112,7 @@ standalone install directory first in `PATH` to select it.
 
 ### Build from source
 
-Requires Go 1.27.2+ with CGO and Node.js 24.11+:
+Requires Go 1.27.4+ with CGO and Node.js 24.22.1+:
 
 ```bash
 git clone https://github.com/kenn-io/agentsview.git
@@ -121,7 +124,8 @@ make install  # installs to ~/.local/bin
 !!! note
 
     CGO is required for the SQLite driver. The `fts5` build tag enables
-    full-text search.
+    full-text search. Add `DUCKDB=1` to `make build` or `make install` to
+    include the [DuckDB mirror](/docs/duckdb/), which release builds leave out.
 
 #### Windows on ARM
 
@@ -202,13 +206,18 @@ docker run --rm -p 127.0.0.1:8080:8080 \
   ghcr.io/kenn-io/agentsview:latest
 ```
 
+To ingest and publish sessions from the same container, enable the commented
+PostgreSQL and push-watch block in `docker-compose.prod.yaml` and set your
+database URL. That file mounts the session roots and `/data` and gives the
+container 40 seconds to finish its final push.
+
 ## Run
 
 The desktop app handles startup automatically: it attaches to an existing local
 daemon or starts one in the background, then opens the discovered URL. The
-daemon is shared with CLI commands and may outlive the desktop window, but it
-self-exits after an idle period when no client request or daemon-owned job is
-active.
+daemon is shared with CLI commands and may outlive the desktop window.
+Automatically started daemons self-exit after an idle period when no client
+request or daemon-owned job is active.
 
 CLI users can start the web UI explicitly:
 
@@ -217,7 +226,8 @@ agentsview serve
 ```
 
 Bare `agentsview serve` runs in the foreground until you press `Ctrl+C`. If a
-compatible server is already running, it reports that server's URL and exits.
+compatible server is already running, it reports that server's URL and exits
+with an error (status 1).
 
 This will:
 
@@ -262,9 +272,17 @@ archive directly in read-only mode. Commands that need fresh data or need to
 write, including `sync`, `usage`, `token-use`, `pg push`, and `duckdb push`,
 auto-start the detached daemon when needed. The server remains running after
 these commands finish. For scripts or CI jobs that must leave no background
-server, stop the daemon first, then run `AGENTSVIEW_NO_DAEMON=1 agentsview sync`.
+server, stop the daemon first, then run `AGENTSVIEW_NO_DAEMON=1 agentsview source sync`.
 That setting disables auto-start; it does not stop a running daemon or bypass
 its archive lock.
+
+### Search by meaning
+
+Choose **Settings → Embeddings → Turn on** or run `agentsview index embeddings build`
+and approve the download. Embeddings run locally by default; agents use keyword
+search until indexing is ready. Use `agentsview session search --semantic` or
+`--hybrid` to search by meaning. See [Semantic Search](/docs/semantic-search/#enabling-vector)
+to configure other providers.
 
 ## Customize
 
@@ -384,8 +402,3 @@ Once running, the web UI provides:
 Use the [Usage Guide](/docs/usage/) for navigation and resume controls. To
 correct project assignments, see the [Data page](/docs/data/) and its opt-in
 project workspace.
-
-Beyond full-text search, opt-in semantic search lets
-`agentsview session search --semantic` (or `--hybrid`) match session content by
-meaning, backed by a local or hosted embeddings endpoint. See
-[Semantic Search](/docs/semantic-search/) for setup.

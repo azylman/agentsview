@@ -23,6 +23,8 @@ type settingsResponse struct {
 	AuthToken           string                    `json:"auth_token,omitempty"`
 	RequireAuth         bool                      `json:"require_auth"`
 	ReadOnly            bool                      `json:"read_only"`
+	RestartSupported    bool                      `json:"restart_supported"`
+	RestartRequired     bool                      `json:"restart_required"`
 }
 
 type sessionProviderResponse struct {
@@ -56,6 +58,13 @@ type settingsUpdateRequest struct {
 	// AgentHomes replaces the alternate home list for each listed provider.
 	// An empty list clears that provider's homes.
 	AgentHomes *map[string][]string `json:"agent_homes,omitempty"`
+}
+
+// displayOnly reports whether the request changes only display preferences,
+// which a read-only server still accepts.
+func (r settingsUpdateRequest) displayOnly() bool {
+	return r.Terminal == nil && r.AuthToken == nil && r.RequireAuth == nil &&
+		r.ToolResultImages == nil && r.DisabledAgents == nil && r.AgentHomes == nil
 }
 
 // toolResultImagesKeepValue is the documented spelling of the keep policy.

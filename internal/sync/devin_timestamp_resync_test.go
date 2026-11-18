@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
@@ -121,12 +122,11 @@ func devinSourceFingerprint(t *testing.T, root string) parser.SourceFingerprint 
 // than the discarded session metadata.
 const staleStartedAt = "1970-01-20T16:13:20Z"
 
-// staleUserVersion picks the archive user_version to stamp: one below the
-// Devin parser version to demand a resync, or the archive-wide version to model an
-// archive that a bump never reached.
+// staleUserVersion models an archive needing a full parser rebuild,
+// or a current archive that a version bump never reached.
 func staleUserVersion(demandResync bool) int {
 	if demandResync {
-		return db.AgentDataVersion(parser.AgentDevin) - 1
+		return dbtest.FullRebuildVersion()
 	}
 	return db.CurrentDataVersion()
 }

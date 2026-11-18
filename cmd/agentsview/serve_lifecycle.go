@@ -152,7 +152,7 @@ func pluralSuffix(count int) string {
 
 // runServeStatus reports whether a server owns this data dir, and where to
 // reach it. It always exits zero; the output distinguishes the states.
-func runServeStatus(cfg config.Config) {
+func runServeStatus(ctx context.Context, cfg config.Config) {
 	var readOnly *DaemonRuntime
 	if rt := FindDaemonRuntime(cfg.DataDir, cfg.AuthToken); rt != nil {
 		if rt.ReadOnly {
@@ -162,7 +162,7 @@ func runServeStatus(cfg config.Config) {
 				fmt.Println(line)
 			}
 			for _, line := range codexCloudStatusLines(
-				context.Background(), urlFromDaemonRuntime(rt), cfg.AuthToken,
+				ctx, urlFromDaemonRuntime(rt), cfg.AuthToken,
 			) {
 				fmt.Println(line)
 			}
@@ -265,8 +265,19 @@ func codexCloudStatusLines(ctx context.Context, baseURL, authToken string) []str
 func serveStatusLines(rt *DaemonRuntime) []string {
 	lines := []string{
 		"agentsview running at " + urlFromDaemonRuntime(rt),
-		fmt.Sprintf("  pid:     %d", rt.Record.PID),
 	}
+	if !rt.ReadOnly && rt.IdleTimeout != nil {
+		lifetime := "Stays running until agentsview daemon stop"
+		if *rt.IdleTimeout > 0 {
+			duration := rt.IdleTimeout.String()
+			if *rt.IdleTimeout%time.Minute == 0 {
+				duration = fmt.Sprintf("%dm", *rt.IdleTimeout/time.Minute)
+			}
+			lifetime = fmt.Sprintf("Exits after %s idle", duration)
+		}
+		lines = append(lines, "  "+lifetime)
+	}
+	lines = append(lines, fmt.Sprintf("  pid:     %d", rt.Record.PID))
 	if rt.Record.Version != "" {
 		lines = append(lines, "  version: "+rt.Record.Version)
 	}
@@ -338,10 +349,8 @@ func serveIncompatibleDaemonStatusLines(
 
 // runServeStop terminates every agentsview server owning this data dir whose
 // identity it can confirm. A record is signalled only once its PID is confirmed
-// to be the recorded daemon -- either it answers the ping probe, or its
-// process identity matches the record (proving the PID was not reused by an
-// unrelated process). This keeps a hung-but-alive daemon stoppable while never
-// signalling a stale record whose PID belongs to something else.
+// to identify the recorded daemon in the caller's PID namespace. A matching
+// process identity also keeps a hung-but-alive daemon stoppable.
 func runServeStop(cfg config.Config) {
 	records, _ := localWritableDaemonRecordsWithFallback(
 		cfg.DataDir, cfg.AuthToken,
@@ -405,7 +414,7 @@ func stopDaemonRuntimeForUpgradeImpl(ctx context.Context,
 		}
 		// A wider bind may also overlap an unrelated listener on the same port.
 		if !reusesEndpoint {
-			if _, err := prepareServeRuntimeConfig(ctx, cfg, serveRuntimeOptions{}); err != nil {
+			if _, err := prepareServeRuntimeConfig(ctx, cfg, serveRuntimeOptions{RequestedPort: cfg.Port}); err != nil {
 				return err
 			}
 		}
@@ -414,7 +423,7 @@ func stopDaemonRuntimeForUpgradeImpl(ctx context.Context,
 		return fmt.Errorf("stopping pid %d: %w", rt.Record.PID, err)
 	}
 	stopOrphanedCaddyChild(rt.Record)
-	return nil
+	return waitForStoppedDaemonWriter(ctx, cfg)
 }
 
 func stopWritableDaemonsForUpdate(ctx context.Context,
@@ -441,6 +450,7 @@ func stopWritableDaemonsForUpdate(ctx context.Context,
 			result.RequireAuth = rt.RequireAuth
 			result.RequireAuthKnown = rt.RequireAuthKnown
 			result.NoSync = rt.NoSync
+			result.Persistent = rt.Persistent
 		}
 		if err := stopDaemonRuntimeForUpgrade(ctx, cfg, rt); err != nil {
 			return result, err
@@ -454,14 +464,10 @@ func stopWritableDaemonsForUpdate(ctx context.Context,
 }
 
 // stopTargetConfirmed reports whether rec's live PID is safe to signal as the
-// recorded agentsview daemon. It accepts the target when the daemon answers the
-// ping probe, or, for a daemon that is alive but no longer answering, when its
-// recorded process identity matches the live process. Either check
-// rules out a PID that an unrelated process reused after the record was
-// written.
-func stopTargetConfirmed(rec daemon.RuntimeRecord, authToken string) bool {
-	return daemonRecordPingConfirmed(rec, authToken) ||
-		processIdentityConfirmed(rec)
+// recorded agentsview daemon. A ping identifies the HTTP endpoint, but its PID
+// may identify a different process in the caller's PID namespace.
+func stopTargetConfirmed(rec daemon.RuntimeRecord, _ string) bool {
+	return processIdentityConfirmed(rec)
 }
 
 // daemonRecordPingConfirmed reports whether rec's PID answers the kit ping
@@ -484,7 +490,7 @@ func probeDaemonRecord(
 			Timeout:         500 * time.Millisecond,
 		},
 	)
-	return info, err == nil && info.PID == rec.PID
+	return info.PingInfo, err == nil && info.PID == rec.PID
 }
 
 // processIdentityConfirmed reports whether the process now holding rec.PID is
@@ -575,11 +581,9 @@ func caddyStopRecord(pid int, createTime string) daemon.RuntimeRecord {
 	}
 }
 
-// stopDaemonProcess signals the daemon to shut down, waits up to grace for it
-// to exit, then escalates to a forced kill. Before escalating it re-checks that
-// the live PID is still the recorded daemon, so a PID reused during the grace
-// wait is never killed. It cleans up the runtime record if the process leaves
-// one behind.
+// stopDaemonProcess confirms the local process identity before each signal,
+// asks the daemon to shut down, then escalates to a forced kill after grace.
+// It cleans up the runtime record if the process leaves one behind.
 func stopDaemonProcess(rec daemon.RuntimeRecord, grace time.Duration) error {
 	return stopDaemonProcessWithIdentity(
 		rec, grace, runtimeRecordIdentityState,
@@ -591,6 +595,15 @@ func stopDaemonProcessWithIdentity(
 	grace time.Duration,
 	identityStateForRecord func(daemon.RuntimeRecord) processCreateTimeState,
 ) error {
+	switch identityStateForRecord(rec) {
+	case processCreateTimeMismatch:
+		removeRuntimeRecordFile(rec)
+		return nil
+	case processCreateTimeMatch:
+		// Only a matching local process identity authorizes the first signal.
+	default:
+		return processIdentityUnconfirmedError(rec, "before graceful shutdown")
+	}
 	proc, err := os.FindProcess(rec.PID)
 	if err != nil {
 		return fmt.Errorf("finding process: %w", err)

@@ -3,18 +3,43 @@
 Read this file before changing build commands, toolchain setup, CI build tags,
 or frontend dependencies. Use the `Makefile` as the command reference.
 
+## CI path filters
+
+Update the CI path filters when adding a reader of files in another lane.
+
 ## CI runner policy
 
-All CI jobs use standard GitHub-hosted runners, including fork pull requests,
+CI jobs use standard GitHub-hosted runners, including fork pull requests,
 scheduled checks, and desktop builds. Select labels from
 [GitHub's supported runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 Keep the explicit architecture labels for Linux ARM64 and macOS desktop builds.
 
-Use the built-in Go cache in `actions/setup-go` and npm caching in
+The exceptions are the seconds-long `CI gate`, `changes`, and
+`Sibling pins on main` jobs. They run on the Namespace profile
+`namespace-profile-linux-1cpu` so they do not wait in the GitHub-hosted queue.
+
+Use the local `go-cache-restore` and `go-cache-save` actions for Go caches and
+disable the built-in cache in `actions/setup-go`. Use npm caching in
 `actions/setup-node`. Set `cache-dependency-path` to the lockfiles for the
 packages the job installs. Desktop jobs cache Rust dependencies through
-`Swatinem/rust-cache` with the GitHub cache backend. Playwright jobs install
-browsers and system dependencies on each run.
+`Swatinem/rust-cache` with the GitHub cache backend. Pull-request workflow
+callers set `cache-mode: read` so jobs can restore caches without saving copies.
+Cache owners opt in with `owner: true` to keep build entries used during the run
+and outputs referenced by fresh action records when refreshing a daily cache.
+Module caches stay on their existing restore and save paths, with all modules
+retained. Playwright jobs run browsers in Microsoft's public MCR image through a
+remote server.
+
+`desktop-artifacts.yml` builds the frontend once on Linux and packages those
+assets in its Windows, Linux, and Linux ARM64 desktop builds.
+
+Go builds and tests use `-trimpath` everywhere: the `Makefile` exports it in
+`GOFLAGS`, the Go workflows set `GOFLAGS: -trimpath`, and desktop sidecar builds
+pass it unless `AGENTSVIEW_SIDECAR_TRIMPATH=false`. Matching flags let desktop
+builds reuse compile results from test jobs and let local worktrees share one
+build cache. See the [README](../../README.md#shared-go-build-cache) for opting
+out and debugging.
+
 Windows Go test and lint jobs in `ci.yml` put caches and temp files under
 `RUNNER_TEMP`. Capture tests use a private system-drive temporary directory so
 ancestor permissions satisfy their checks.
@@ -23,9 +48,44 @@ ancestor permissions satisfy their checks.
 
 - Build with `CGO_ENABLED=1`; the SQLite driver requires CGO.
 - Use the `fts5` build tag for full-text search.
-- Do not add the `kit_posthog_disabled` tag to `go test`. The telemetry reporter
-  disables itself under `testing.Testing()`. E2E binaries run as real
-  processes, so their build keeps the tag.
+- The `duckdb` build tag links the DuckDB mirror driver. Builds without it,
+  including every release artifact, get the stub in
+  `internal/duckdb/driver_unavailable.go`. DuckDB 2.0's prebuilt libraries
+  require x86-64-v3 and run code from a package `init`, so linking them made
+  every agentsview start crash on older x86-64 CPUs. Build targets add the tag
+  only with `DUCKDB=1`. Tests, vet, lint, and the e2e server link DuckDB so
+  they cover the mirror, and CI also runs `internal/duckdb` without the tag.
+  CI also starts that build under QEMU on a Nehalem CPU model (x86-64-v2), so
+  code that needs a newer CPU at startup fails CI. Tag DuckDB-only test files
+  `duckdb`; a test elsewhere that needs the driver skips when
+  `duckdb.RequireDriver()` returns an error.
+- The Makefile's `LDFLAGS` set the PostHog project key with
+  `-X go.kenn.io/kit/telemetry/posthog.projectKey`. Builds without it send no
+  telemetry, so keep it out of test and e2e builds.
+- `DISTRIBUTION` sets `main.distribution` and
+  `go.kenn.io/kit/telemetry/posthog.distribution` to who ships the binary.
+  Official direct downloads use `kenn` and keep self-updating, like builds
+  with no value. Any other value names a package manager: those builds refuse
+  `agentsview update` installs and point users at the package manager.
+  `make homebrew` is the release build with `DISTRIBUTION=homebrew`, written
+  to `$(BINDIR)/agentsview`.
+
+## Kit checkers
+
+`tools/go.mod` pins the kit checkers that CI and the hooks run: `kennlint` and
+`huma-check`. Makefile targets run them with `go tool -modfile=tools/go.mod`, so
+`tools/go.sum` verifies them.
+
+Do not run kit tools as `go run go.kenn.io/kit/cmd/...@version`. That form also
+fetches the newest kit `go.mod` to look for a deprecation notice and verifies it
+against the checksum database. A kit release the checksum database has not
+recorded yet then fails every such command.
+
+`kennlint config -check` compares `.golangci.yml` with the config from the kit
+version in `tools/go.mod`. That config must match the kit golangci plugin in
+`.custom-gcl.yml`. Bump both together with
+`go -C tools get -tool go.kenn.io/kit/cmd/kennlint@<version>` and
+`go -C tools mod tidy`. Renovate skips `tools/go.mod` for this reason.
 
 ## Frontend
 

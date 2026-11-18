@@ -75,23 +75,36 @@ type sharedUnwatchedPollCoordinator struct {
 	// coordinator loop; each entry keeps its probe so availability is
 	// evaluated per obligation at poll time.
 	pollObligations []pollingObligation
+	// gap, when set, is the owner's shortest allowed time between passes
+	// started by the ticker. It can exceed the tick, so background collection
+	// polls less often than the ticker fires. Guarded by pollMu.
+	gap func() time.Duration
 	// lastCompletion is the wall-clock time the most recent pass completed.
 	// Zero means no prior pass; a zero value skips the cooldown on the first wake.
 	lastCompletion time.Time
-	stop           chan struct{}
-	done           chan struct{}
-	stopOnce       sync.Once
+	// lastPassDuration is how long the most recent pass ran. The cooldown is
+	// at least this long, so polling occupies at most half of wall-clock time
+	// however slow a pass gets.
+	lastPassDuration time.Duration
+	stop             chan struct{}
+	done             chan struct{}
+	stopOnce         sync.Once
 }
 
 func newUnwatchedPollCoordinator(
 	ctx context.Context,
 	engine unwatchedPollSyncer,
 	idleTracker *server.IdleTracker,
+	gap func() time.Duration,
 ) *sharedUnwatchedPollCoordinator {
 	ticker := time.NewTicker(unwatchedPollInterval)
-	return newUnwatchedPollCoordinatorWithTicks(
+	coordinator := newUnwatchedPollCoordinatorWithTicks(
 		ctx, engine, ticker.C, ticker.Stop, idleTracker.Do, nil, time.Now, time.After,
 	)
+	coordinator.pollMu.Lock()
+	coordinator.gap = gap
+	coordinator.pollMu.Unlock()
+	return coordinator
 }
 
 func newUnwatchedPollCoordinatorWithTicks(
@@ -217,9 +230,23 @@ func (c *sharedUnwatchedPollCoordinator) run() {
 			}
 			close(request.done)
 		case <-c.ticks:
-			c.requestPoll()
+			if c.tickDue() {
+				c.requestPoll()
+			}
 		}
 	}
+}
+
+// tickDue reports whether a tick may start a pass under the owner's gap.
+func (c *sharedUnwatchedPollCoordinator) tickDue() bool {
+	c.pollMu.Lock()
+	gapFor, last := c.gap, c.lastCompletion
+	c.pollMu.Unlock()
+	if gapFor == nil {
+		return true
+	}
+	gap := gapFor()
+	return gap != collectionPaused && (last.IsZero() || c.now().Sub(last) >= gap)
 }
 
 func (c *sharedUnwatchedPollCoordinator) setPollObligations(
@@ -265,16 +292,19 @@ func (c *sharedUnwatchedPollCoordinator) runPollWorker() {
 			if c.workerCtx.Err() != nil {
 				return
 			}
-			// Cooldown gate: if the previous pass completed less than
-			// unwatchedPollInterval ago, wait out the remaining idle time.
-			// The gate is here (after consuming the wake) so every path into
-			// a pass crosses it. lastCompletion is zero on first construction,
+			// Cooldown gate: wait until the previous pass completed at least
+			// unwatchedPollInterval ago, or as long ago as that pass ran,
+			// whichever is longer. A pass that takes an hour therefore gets an
+			// hour's break rather than starting again two minutes later. The
+			// gate is here (after consuming the wake) so every path into a
+			// pass crosses it. lastCompletion is zero on first construction,
 			// which means no prior pass and therefore no cooldown on startup.
 			c.pollMu.Lock()
 			last := c.lastCompletion
+			cooldown := max(unwatchedPollInterval, c.lastPassDuration)
 			c.pollMu.Unlock()
 			if !last.IsZero() {
-				remaining := last.Add(unwatchedPollInterval).Sub(c.now())
+				remaining := last.Add(cooldown).Sub(c.now())
 				if remaining > 0 {
 					select {
 					case <-c.workerCtx.Done():
@@ -313,6 +343,7 @@ func (c *sharedUnwatchedPollCoordinator) runPollWorker() {
 			}
 			c.pollMu.Lock()
 			c.lastCompletion = completedAt
+			c.lastPassDuration = completedAt.Sub(startedAt)
 			c.pollMu.Unlock()
 		}
 	}

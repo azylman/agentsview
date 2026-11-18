@@ -1,4 +1,4 @@
-minimum_prek_version = "0.3.6"
+minimum_prek_version = "0.5.7"
 default_install_hook_types = ["pre-commit", "pre-push"]
 default_stages = ["pre-commit"]
 
@@ -26,7 +26,7 @@ always_run = true
 id = "huma-check"
 name = "Check Huma API contract"
 language = "system"
-entry = "go run go.kenn.io/kit/cmd/huma-check@e9840a327158da2559458186b253b0c15a5e2c2b -fix=false ./..."
+entry = "make lint-huma"
 stages = ["pre-push"]
 pass_filenames = false
 always_run = true

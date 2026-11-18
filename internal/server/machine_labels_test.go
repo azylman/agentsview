@@ -5,7 +5,6 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
-	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -13,6 +12,7 @@ import (
 	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/duckdb"
 	"go.kenn.io/agentsview/internal/server"
 	"go.kenn.io/agentsview/internal/storage"
@@ -122,8 +122,8 @@ func TestMachineFilterErrorsBeforeHTTPResponse(t *testing.T) {
 }
 
 func TestMachineAliasesOnDuckDB(t *testing.T) {
-	if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
-		t.Skip("duckdb-go-bindings does not ship a windows/arm64 library")
+	if duckdb.RequireDriver() != nil {
+		t.Skip("this build does not link DuckDB; run with -tags duckdb")
 	}
 	te := setup(t)
 	te.seedSession(t, "current", "project", 5, func(s *db.Session) {
@@ -132,6 +132,7 @@ func TestMachineAliasesOnDuckDB(t *testing.T) {
 	})
 	require.NoError(t, te.db.SetSyncState(t.Context(), "machine_alias:old-owner", "installation-a"))
 	path := filepath.Join(t.TempDir(), "mirror.duckdb")
+	dbtest.SeedMirrorPricing(t, te.db)
 	_, err := duckdb.Push(t.Context(), path, te.db, "installation-a", storage.MirrorPushOptions{}, true, nil)
 	require.NoError(t, err)
 	store, err := duckdb.NewStore(t.Context(), path)

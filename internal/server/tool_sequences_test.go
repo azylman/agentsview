@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"testing"
 
@@ -383,8 +382,8 @@ func TestHandleToolSequences_ReadOnly(t *testing.T) {
 }
 
 func TestHandleToolSequences_DuckDBParity(t *testing.T) {
-	if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
-		t.Skip("duckdb-go-bindings does not ship a windows/arm64 library")
+	if duckdb.RequireDriver() != nil {
+		t.Skip("this build does not link DuckDB; run with -tags duckdb")
 	}
 	te := setup(t)
 	sessionIDs := dbtest.SeedToolSequencesParity(t, te.db)
@@ -418,6 +417,7 @@ func TestHandleToolSequences_DuckDBParity(t *testing.T) {
 		require.NoError(t, te.db.UpdateSessionSignals(t.Context(), id, update))
 	}
 	path := filepath.Join(t.TempDir(), "mirror.duckdb")
+	dbtest.SeedMirrorPricing(t, te.db)
 	_, err := duckdb.Push(t.Context(), path, te.db, "test-installation", storage.MirrorPushOptions{}, true, nil)
 	require.NoError(t, err)
 	store, err := duckdb.NewStore(t.Context(), path)

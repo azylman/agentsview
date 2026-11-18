@@ -196,7 +196,7 @@ func TestStopTargetConfirmedRejectsMismatchedV2(t *testing.T) {
 	assert.False(t, stopTargetConfirmed(rec, ""))
 }
 
-func TestStopTargetConfirmedMatchingPingBypassesIdentityState(t *testing.T) {
+func TestStopTargetConfirmedMatchingPingRequiresIdentity(t *testing.T) {
 	endpoint := newPingDaemonWithPID(t, os.Getpid())
 	rec := daemon.RuntimeRecord{
 		PID:               os.Getpid(),
@@ -207,8 +207,8 @@ func TestStopTargetConfirmedMatchingPingBypassesIdentityState(t *testing.T) {
 	}
 
 	assert.True(t, daemonRecordPingConfirmed(rec, ""))
-	assert.True(t, stopTargetConfirmed(rec, ""),
-		"a matching ping remains an independent initial-stop route")
+	assert.False(t, stopTargetConfirmed(rec, ""),
+		"a matching ping does not prove the PID identifies a local process")
 }
 
 func TestStopDaemonProcessForceKillsHungDaemonAfterClockStep(t *testing.T) {
@@ -230,16 +230,18 @@ func TestStopDaemonProcessForceKillsHungDaemonAfterClockStep(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	require.NoError(t, stopDaemonProcess(onlyLiveRuntimeRecord(t, dir), 50*time.Millisecond))
+	// The grace budget also bounds exit after SIGKILL. Allow the OS time to
+	// schedule the child under race-detector CI load.
+	require.NoError(t, stopDaemonProcess(onlyLiveRuntimeRecord(t, dir), time.Second))
 	<-reaped
 	assert.False(t, daemon.ProcessAlive(pid))
 	assert.NoFileExists(t, path)
 }
 
-func TestStopDaemonProcessMismatchedV2DoesNotForceKill(t *testing.T) {
+func TestStopDaemonProcessMismatchedV2DoesNotSignal(t *testing.T) {
 	setStartProbeTickForTest(t, 10*time.Millisecond)
 	dir := runtimeTestDir(t)
-	pid, reaped := startReapedTERMIgnoringProcess(t)
+	pid, reaped := startReapedSleepProcess(t)
 	identity, ok := daemon.ReadProcessIdentity(pid)
 	require.True(t, ok)
 	createTime, ok := processCreateTimeMillis(pid)
@@ -261,15 +263,15 @@ func TestStopDaemonProcessMismatchedV2DoesNotForceKill(t *testing.T) {
 	assert.NoFileExists(t, path)
 	select {
 	case <-reaped:
-		assert.Fail(t, "mismatched v2 identity must not force-kill the process")
+		assert.Fail(t, "mismatched v2 identity must not signal the process")
 	default:
 	}
 }
 
-func TestStopDaemonProcessUnknownV2DoesNotForceKill(t *testing.T) {
+func TestStopDaemonProcessUnknownV2DoesNotSignal(t *testing.T) {
 	setStartProbeTickForTest(t, 10*time.Millisecond)
 	dir := runtimeTestDir(t)
-	pid, reaped := startReapedTERMIgnoringProcess(t)
+	pid, reaped := startReapedSleepProcess(t)
 	createTime, ok := processCreateTimeMillis(pid)
 	require.True(t, ok)
 	path, err := writeRuntimeRecordForTest(dir, daemon.RuntimeRecord{
@@ -290,7 +292,7 @@ func TestStopDaemonProcessUnknownV2DoesNotForceKill(t *testing.T) {
 	assert.FileExists(t, path)
 	select {
 	case <-reaped:
-		assert.Fail(t, "unknown v2 identity must not force-kill the process")
+		assert.Fail(t, "unknown v2 identity must not signal the process")
 	default:
 	}
 }

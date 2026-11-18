@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM node:24-bookworm AS frontend-build
+FROM --platform=$BUILDPLATFORM node:24.22.1-bookworm AS frontend-build
 
 WORKDIR /src/frontend
 
@@ -14,7 +14,7 @@ COPY frontend/ ./
 COPY internal/importer/claude_ai_requests.txt /src/internal/importer/claude_ai_requests.txt
 RUN npm run build
 
-FROM golang:1.27.2-bookworm AS build
+FROM golang:1.27.4-bookworm AS build
 
 ENV GOPROXY="https://proxy.golang.org|direct"
 
@@ -44,11 +44,13 @@ ARG TARGETARCH
 ARG VERSION=dev
 ARG COMMIT=unknown
 ARG BUILD_DATE=
+# Pass --build-arg GO_TAGS=fts5,duckdb to include the DuckDB mirror.
+ARG GO_TAGS=fts5
 
 RUN go run ./internal/pricing/cmd/litellm-snapshot -restore
 
 RUN CGO_ENABLED=1 GOOS=$TARGETOS GOARCH=$TARGETARCH \
-    go build -tags fts5 -trimpath -buildvcs=false \
+    go build -tags "${GO_TAGS}" -trimpath -buildvcs=false \
       -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE}" \
       -o /out/agentsview ./cmd/agentsview
 
@@ -62,7 +64,7 @@ RUN mkdir -p /data /agents
 ENV AGENTSVIEW_DATA_DIR=/data \
     AGENTSVIEW_MODE=serve \
     AGENTSVIEW_HOST=0.0.0.0 \
-    AGENTSVIEW_REQUIRE_AUTH=false \
+    AGENTSVIEW_REQUIRE_AUTH=true \
     AGENTSVIEW_NO_BROWSER=true
 
 COPY --from=build /out/agentsview /usr/local/bin/agentsview

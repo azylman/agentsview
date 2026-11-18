@@ -142,14 +142,6 @@ func TestPricingMuseModels(t *testing.T) {
 	}
 }
 
-func TestDateAliasedModels(t *testing.T) {
-	assert.Equal(t, []string{
-		"daimon-kimi-code",
-		"daimon-kimi-messages",
-		"kimi-for-coding",
-	}, DateAliasedModels())
-}
-
 func TestKimiK26Aliases(t *testing.T) {
 	assert.Equal(t, []string{"k2d6-agent"}, KimiK26Aliases())
 }
@@ -324,6 +316,24 @@ func TestSeedVersion_FoldsInSupplementalVersion(t *testing.T) {
 		SeedVersion)
 	assert.NotEqual(t, FallbackVersion, SeedVersion,
 		"SeedVersion must differ from FallbackVersion")
+}
+
+func TestSetConfiguredAliases(t *testing.T) {
+	t.Cleanup(func() { SetConfiguredAliases(nil) })
+	SetConfiguredAliases(map[string]string{
+		"gateway-sol":       "gpt-6-sol",
+		"gateway/exact-sol": "gpt-6.1-sol",
+		"exact-sol":         "gpt-5.6-sol",
+	})
+	for model, want := range map[string]string{
+		"gateway-sol":       "gpt-6-sol",
+		"any/gateway-sol":   "gpt-6-sol",
+		"gateway/exact-sol": "gpt-6.1-sol",
+		"other/exact-sol":   "gpt-5.6-sol",
+		"gateway-sol-2":     "",
+	} {
+		assert.Equal(t, want, ConfiguredAliasTarget(model), model)
+	}
 }
 
 func TestFixedPricingAliasesReturnsCopy(t *testing.T) {
