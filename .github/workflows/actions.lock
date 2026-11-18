@@ -51,6 +51,13 @@ workflows:
         - 'kenn-io/kit@v0.53.2'
         - 'msys2/setup-msys2@v2.33.0'
         - 'step-security/rust-cache@v2.9.2'
+    '.github/workflows/docker-publish.yml':
+        - 'actions/checkout@v7.0.1'
+        - 'actions/setup-go@v7.0.0'
+        - 'docker/build-push-action@v5'
+        - 'docker/login-action@v3'
+        - 'docker/metadata-action@v5'
+        - 'docker/setup-buildx-action@v3'
     '.github/workflows/fuzz.yml':
         - 'actions/cache@v6.1.0'
         - 'actions/checkout@v7.0.1'
@@ -112,6 +119,26 @@ dependencies:
         commit: 'sha1-68559e99cc807c1eb7e9238fd43a15bba460eec2'
         owner_id: 115962839
         repo_id: 846733598
+    'docker/build-push-action@v5':
+        ref: 'v5'
+        commit: 'sha1-ca052bb54ab0790a636c9b5f226502c73d547a25'
+        owner_id: 5429470
+        repo_id: 241092383
+    'docker/login-action@v3':
+        ref: 'v3'
+        commit: 'sha1-c94ce9fb468520275223c153574b00df6fe4bcc9'
+        owner_id: 5429470
+        repo_id: 287743349
+    'docker/metadata-action@v5':
+        ref: 'v5'
+        commit: 'sha1-c299e40c65443455700f0fdfc63efafe5b349051'
+        owner_id: 5429470
+        repo_id: 306769011
+    'docker/setup-buildx-action@v3':
+        ref: 'v3'
+        commit: 'sha1-8d2750c68a42422c14e847fe6c8ac0403b4cbd6f'
+        owner_id: 5429470
+        repo_id: 288485773
     'dtolnay/rust-toolchain@master':
         ref: 'master'
         commit: 'sha1-df2a88e9fe4098bad09cb42c3dec7187f15861fc'
